@@ -262,114 +262,160 @@ def _reset_project_impl(project_id: str):
 
 # ============== 接口1：上传文件并生成本体 ==============
 
+def _form_bool(field_name: str, default: bool = False) -> bool:
+    raw = request.form.get(field_name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
 @graph_bp.route('/ontology/generate', methods=['POST'])
 def generate_ontology():
     """
-    接口1：上传文件，分析生成本体定义
-    
-    请求方式：multipart/form-data
-    
-    参数：
-        files: 上传的文件（PDF/MD/TXT），可多个
-        simulation_requirement: 模拟需求描述（必填）
-        project_name: 项目名称（可选）
-        additional_context: 额外说明（可选）
-        
-    返回：
-        {
-            "success": true,
-            "data": {
-                "project_id": "proj_xxxx",
-                "ontology": {
-                    "entity_types": [...],
-                    "edge_types": [...],
-                    "analysis_summary": "..."
-                },
-                "files": [...],
-                "total_text_length": 12345
-            }
-        }
+    Upload one or more files and generate ontology.
+
+    Supports chunked upload mode by passing:
+    - project_id: continue an existing project
+    - defer_ontology=true: save docs now, skip LLM ontology generation for this chunk
     """
     project = None
     try:
-        logger.info("=== 开始生成本体定义 ===")
-        
-        # 获取参数
-        simulation_requirement = request.form.get('simulation_requirement', '')
-        project_name = request.form.get('project_name', 'Unnamed Project')
-        additional_context = request.form.get('additional_context', '')
-        
-        logger.debug(f"项目名称: {project_name}")
-        logger.debug(f"模拟需求: {simulation_requirement[:100]}...")
-        
+        logger.info("=== Start ontology generation ===")
+
+        simulation_requirement = request.form.get('simulation_requirement', '').strip()
+        project_name = request.form.get('project_name', 'Unnamed Project').strip() or 'Unnamed Project'
+        additional_context = request.form.get('additional_context', '').strip()
+        project_id = request.form.get('project_id', '').strip()
+        defer_ontology = _form_bool('defer_ontology', default=False)
+
+        logger.debug(f"project_name={project_name}")
+        logger.debug(f"project_id={project_id or '-'}")
+        logger.debug(f"defer_ontology={defer_ontology}")
+
+        if project_id:
+            project = ProjectManager.get_project(project_id)
+            if not project:
+                return jsonify({
+                    "success": False,
+                    "error": t('api.projectNotFound', id=project_id)
+                }), 404
+
+            if project_name and project.name != project_name:
+                project.name = project_name
+
+            if simulation_requirement:
+                project.simulation_requirement = simulation_requirement
+            else:
+                simulation_requirement = (project.simulation_requirement or '').strip()
+
+            logger.info(f"Continue existing project: {project.project_id}")
+        else:
+            if not simulation_requirement:
+                return jsonify({
+                    "success": False,
+                    "error": t('api.requireSimulationRequirement')
+                }), 400
+
+            project = ProjectManager.create_project(name=project_name)
+            project.simulation_requirement = simulation_requirement
+            logger.info(f"Create project: {project.project_id}")
+
         if not simulation_requirement:
             return jsonify({
                 "success": False,
                 "error": t('api.requireSimulationRequirement')
             }), 400
-        
-        # 获取上传的文件
+
         uploaded_files = request.files.getlist('files')
-        if not uploaded_files or all(not f.filename for f in uploaded_files):
+        has_uploaded_files = bool(uploaded_files and any(f and f.filename for f in uploaded_files))
+        if not has_uploaded_files and not project.files:
+            if not project_id:
+                ProjectManager.delete_project(project.project_id)
             return jsonify({
                 "success": False,
                 "error": t('api.requireFileUpload')
             }), 400
-        
-        # 创建项目
-        project = ProjectManager.create_project(name=project_name)
-        project.simulation_requirement = simulation_requirement
-        logger.info(f"创建项目: {project.project_id}")
-        
-        # 保存文件并提取文本
-        document_texts = []
-        all_text = ""
-        
+
+        existing_text = ProjectManager.get_extracted_text(project.project_id) or ""
+        new_text_parts = []
+        new_document_texts = []
+
         for file in uploaded_files:
-            if file and file.filename and allowed_file(file.filename):
-                # 保存文件到项目目录
-                file_info = ProjectManager.save_file_to_project(
-                    project.project_id, 
-                    file, 
-                    file.filename
-                )
-                project.files.append({
-                    "filename": file_info["original_filename"],
-                    "size": file_info["size"]
-                })
-                
-                # 提取文本
-                text = FileParser.extract_text(file_info["path"])
-                text = TextProcessor.preprocess_text(text)
-                document_texts.append(text)
-                all_text += f"\n\n=== {file_info['original_filename']} ===\n{text}"
-        
-        if not document_texts:
-            ProjectManager.delete_project(project.project_id)
+            if not file or not file.filename:
+                continue
+            if not allowed_file(file.filename):
+                logger.warning(f"Skip unsupported file: {file.filename}")
+                continue
+
+            file_info = ProjectManager.save_file_to_project(
+                project.project_id,
+                file,
+                file.filename
+            )
+            project.files.append({
+                "filename": file_info["original_filename"],
+                "saved_filename": file_info["saved_filename"],
+                "size": file_info["size"]
+            })
+
+            text = FileParser.extract_text(file_info["path"])
+            text = TextProcessor.preprocess_text(text)
+            if text:
+                new_document_texts.append(text)
+                new_text_parts.append(f"\n\n=== {file_info['original_filename']} ===\n{text}")
+
+        if has_uploaded_files and not new_document_texts:
+            if not project_id:
+                ProjectManager.delete_project(project.project_id)
             return jsonify({
                 "success": False,
                 "error": t('api.noDocProcessed')
             }), 400
-        
-        # 保存提取的文本
+
+        all_text = f"{existing_text}{''.join(new_text_parts)}".strip()
+        if all_text:
+            ProjectManager.save_extracted_text(project.project_id, all_text)
         project.total_text_length = len(all_text)
-        ProjectManager.save_extracted_text(project.project_id, all_text)
-        logger.info(f"文本提取完成，共 {len(all_text)} 字符")
-        
-        # 生成本体
-        logger.info("调用 LLM 生成本体定义...")
+        logger.info(f"Text prepared, total chars: {project.total_text_length}")
+
+        if defer_ontology:
+            project.status = ProjectStatus.CREATED
+            project.ontology = None
+            project.analysis_summary = None
+            ProjectManager.save_project(project)
+
+            logger.info(f"Chunk stored, ontology deferred: {project.project_id}")
+            return jsonify({
+                "success": True,
+                "data": {
+                    "project_id": project.project_id,
+                    "project_name": project.name,
+                    "files": project.files,
+                    "total_text_length": project.total_text_length,
+                    "deferred_ontology": True
+                }
+            })
+
+        if not all_text:
+            if not project_id:
+                ProjectManager.delete_project(project.project_id)
+            return jsonify({
+                "success": False,
+                "error": "Extracted document text is empty; cannot generate ontology"
+            }), 400
+
+        logger.info("Calling LLM to generate ontology...")
         generator = OntologyGenerator()
         ontology = generator.generate(
-            document_texts=document_texts,
+            document_texts=[all_text],
             simulation_requirement=simulation_requirement,
             additional_context=additional_context if additional_context else None
         )
-        
-        # 保存本体到项目
+
         entity_count = len(ontology.get("entity_types", []))
         edge_count = len(ontology.get("edge_types", []))
-        logger.info(f"本体生成完成: {entity_count} 个实体类型, {edge_count} 个关系类型")
-        
+        logger.info(f"Ontology generated: entities={entity_count}, edges={edge_count}")
+
         project.ontology = {
             "entity_types": ontology.get("entity_types", []),
             "edge_types": ontology.get("edge_types", [])
@@ -377,8 +423,8 @@ def generate_ontology():
         project.analysis_summary = ontology.get("analysis_summary", "")
         project.status = ProjectStatus.ONTOLOGY_GENERATED
         ProjectManager.save_project(project)
-        logger.info(f"=== 本体生成完成 === 项目ID: {project.project_id}")
-        
+        logger.info(f"=== Ontology generation completed === project={project.project_id}")
+
         return jsonify({
             "success": True,
             "data": {
@@ -837,8 +883,6 @@ def _build_graph_impl():
             "error": str(e),
             "traceback": traceback.format_exc()
         }), 500
-
-
 # ============== 任务查询接口 ==============
 
 @graph_bp.route('/task/<task_id>', methods=['GET'])

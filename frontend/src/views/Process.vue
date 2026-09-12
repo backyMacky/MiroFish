@@ -414,7 +414,7 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { generateOntology, getProject, buildGraph, getTaskStatus, getGraphData } from '../api/graph'
+import { generateOntologyChunked, getProject, buildGraph, getTaskStatus, getGraphData } from '../api/graph'
 import { getPendingUpload, clearPendingUpload } from '../store/pendingUpload'
 import * as d3 from 'd3'
 
@@ -579,15 +579,19 @@ const handleNewProject = async () => {
     currentPhase.value = 0 // 本体生成阶段
     ontologyProgress.value = { message: '正在上传文件并分析文档...' }
     
-    // 构建 FormData
-    const formDataObj = new FormData()
-    pending.files.forEach(file => {
-      formDataObj.append('files', file)
+    const response = await generateOntologyChunked({
+      files: pending.files,
+      simulationRequirement: pending.simulationRequirement,
+      onChunkStart: ({ chunkIndex, totalChunks, fileCount }) => {
+        if (totalChunks <= 1) {
+          ontologyProgress.value = { message: '正在上传文件并分析文档...' }
+          return
+        }
+        ontologyProgress.value = {
+          message: `正在上传第 ${chunkIndex}/${totalChunks} 批文档（${fileCount} 个文件）...`
+        }
+      }
     })
-    formDataObj.append('simulation_requirement', pending.simulationRequirement)
-    
-    // 调用本体生成 API
-    const response = await generateOntology(formDataObj)
     
     if (response.success) {
       // 清除待上传数据

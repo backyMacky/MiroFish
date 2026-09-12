@@ -45,7 +45,9 @@ const routes = [
 ]
 
 const router = createRouter({
-  history: createWebHistory(),
+  // Use Vite's BASE_URL so this works at both `/` (local dev) and `/p/mirofish/` (nginx prod).
+  // Vite injects import.meta.env.BASE_URL from the `base` option in vite.config.js.
+  history: createWebHistory(import.meta.env.BASE_URL),
   routes
 })
 

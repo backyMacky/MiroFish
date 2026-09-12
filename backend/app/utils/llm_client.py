@@ -1,10 +1,12 @@
 """
-LLM客户端封装
-统一使用OpenAI格式调用
+LLM Client Wrapper
+Unified OpenAI format API calls
+Supports Ollama num_ctx parameter to prevent prompt truncation
 """
 
 import json
 import logging
+import os
 import re
 from typing import Optional, Dict, Any, List
 from openai import OpenAI
@@ -89,25 +91,35 @@ def _contains_additional_json_container(content: str) -> bool:
 
 
 class LLMClient:
-    """LLM客户端"""
-    
+    """LLM Client"""
+
     def __init__(
         self,
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
-        model: Optional[str] = None
+        model: Optional[str] = None,
+        timeout: float = 300.0
     ):
         self.api_key = api_key or Config.LLM_API_KEY
         self.base_url = base_url or Config.LLM_BASE_URL
         self.model = model or Config.LLM_MODEL_NAME
-        
+
         if not self.api_key:
-            raise ValueError("LLM_API_KEY 未配置")
-        
+            raise ValueError("LLM_API_KEY not configured")
+
         self.client = OpenAI(
             api_key=self.api_key,
-            base_url=self.base_url
+            base_url=self.base_url,
+            timeout=timeout,
         )
+
+        # Ollama context window size — prevents prompt truncation for the
+        # large ontology prompts used by the chunked generation workflow.
+        self._num_ctx = int(os.environ.get("OLLAMA_NUM_CTX", "8192"))
+
+    def _is_ollama(self) -> bool:
+        """Check whether the configured endpoint is a local Ollama server."""
+        return "11434" in (getattr(self, "base_url", None) or "")
 
     def _create_completion(
         self,
@@ -119,6 +131,23 @@ class LLMClient:
     ) -> Any:
         """Send one raw Chat Completions request through the compatibility layer."""
 
+        # Preserve upstream's GPT-5/provider compatibility path everywhere.
+        # Ollama alone needs its context-window option in the request body;
+        # its OpenAI-compatible endpoint uses the legacy parameter names.
+        if self._is_ollama() and self._num_ctx:
+            kwargs: Dict[str, Any] = {
+                "model": self.model,
+                "messages": messages,
+                "extra_body": {"options": {"num_ctx": self._num_ctx}},
+            }
+            if temperature is not None:
+                kwargs["temperature"] = temperature
+            if max_tokens is not None:
+                kwargs["max_tokens"] = max_tokens
+            if response_format is not None:
+                kwargs["response_format"] = response_format
+            return self.client.chat.completions.create(**kwargs)
+
         return create_chat_completion(
             self.client,
             model=self.model,
@@ -127,7 +156,7 @@ class LLMClient:
             max_tokens=max_tokens,
             response_format=response_format,
         )
-    
+
     def chat(
         self,
         messages: List[Dict[str, str]],
@@ -136,16 +165,16 @@ class LLMClient:
         response_format: Optional[Dict] = None
     ) -> str:
         """
-        发送聊天请求
-        
+        Send chat request
+
         Args:
-            messages: 消息列表
-            temperature: 温度参数
-            max_tokens: 最大token数
-            response_format: 响应格式（如JSON模式）
-            
+            messages: Message list
+            temperature: Temperature parameter
+            max_tokens: Max token count
+            response_format: Response format (e.g., JSON mode)
+
         Returns:
-            模型响应文本
+            Model response text
         """
         response = self._create_completion(
             messages=messages,
@@ -155,7 +184,7 @@ class LLMClient:
         )
         content = extract_chat_completion_text(response)
         return _clean_chat_text(content)
-    
+
     def chat_json(
         self,
         messages: List[Dict[str, str]],
@@ -164,16 +193,17 @@ class LLMClient:
         max_attempts: int = 1,
     ) -> Dict[str, Any]:
         """
-        发送聊天请求并返回JSON
-        
+        Send chat request and return JSON
+
         Args:
-            messages: 消息列表
-            temperature: 温度参数
-            max_tokens: 最大token数
-            max_attempts: 内容生成尝试次数（不含一次明确的JSON模式能力降级）
-            
+            messages: Message list
+            temperature: Temperature parameter
+            max_tokens: Max token count
+            max_attempts: Content-generation attempts, excluding one explicit
+                JSON-mode capability fallback
+
         Returns:
-            解析后的JSON对象
+            Parsed JSON object
         """
         if max_attempts < 1:
             raise ValueError("max_attempts must be at least 1")
@@ -257,6 +287,7 @@ class LLMClient:
                 finish_reason=finish_reason,
             )
 
+        # Try direct parse first
         try:
             value = json.loads(content)
         except json.JSONDecodeError as strict_error:
