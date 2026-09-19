@@ -415,6 +415,7 @@
 import { ref, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { generateOntologyChunked, getProject, buildGraph, getTaskStatus, getGraphData } from '../api/graph'
+import { createSimulation } from '../api/simulation'
 import { getPendingUpload, clearPendingUpload } from '../store/pendingUpload'
 import * as d3 from 'd3'
 
@@ -480,9 +481,29 @@ const goHome = () => {
   router.push('/')
 }
 
-const goToNextStep = () => {
-  // TODO: 进入环境搭建步骤
-  alert('环境搭建功能开发中...')
+const goToNextStep = async () => {
+  if (!projectData.value?.project_id || !projectData.value?.graph_id) {
+    error.value = '项目或图谱信息缺失，无法进入环境搭建'
+    return
+  }
+
+  try {
+    const response = await createSimulation({
+      project_id: projectData.value.project_id,
+      graph_id: projectData.value.graph_id,
+      enable_twitter: true,
+      enable_reddit: true,
+    })
+    if (!response.success || !response.data?.simulation_id) {
+      throw new Error(response.error || '创建模拟失败')
+    }
+    await router.push({
+      name: 'Simulation',
+      params: { simulationId: response.data.simulation_id },
+    })
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : '创建模拟失败'
+  }
 }
 
 const toggleFullScreen = () => {
