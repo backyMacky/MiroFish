@@ -12,6 +12,7 @@ Adopt step-by-step generation strategy to avoid failures from generating too lon
 
 import json
 import math
+import os
 from typing import Dict, Any, List, Optional, Callable
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
@@ -233,6 +234,12 @@ class SimulationConfigGenerator:
         self.api_key = api_key or Config.LLM_API_KEY
         self.base_url = base_url or Config.LLM_BASE_URL
         self.model_name = model_name or Config.LLM_MODEL_NAME
+        self.AGENTS_PER_BATCH = int(os.getenv("SIMULATION_AGENTS_PER_BATCH", "15"))
+        self.agent_max_tokens = int(os.getenv("SIMULATION_AGENT_MAX_TOKENS", "4096"))
+        if not 1 <= self.AGENTS_PER_BATCH <= 32:
+            raise ValueError("SIMULATION_AGENTS_PER_BATCH must be between 1 and 32")
+        if not 256 <= self.agent_max_tokens <= 32768:
+            raise ValueError("SIMULATION_AGENT_MAX_TOKENS must be between 256 and 32768")
 
         if not self.api_key:
             raise ValueError("LLM_API_KEY not configured")
@@ -432,7 +439,7 @@ class SimulationConfigGenerator:
 
         return "\n".join(lines)
     
-    def _call_llm_with_retry(self, prompt: str, system_prompt: str) -> Dict[str, Any]:
+    def _call_llm_with_retry(self, prompt: str, system_prompt: str, max_tokens: int = 4096) -> Dict[str, Any]:
         """Request one complete configuration; surface provider failures for retry."""
         try:
             response = create_chat_completion(
@@ -440,7 +447,7 @@ class SimulationConfigGenerator:
                 messages=[{"role": "system", "content": system_prompt},
                           {"role": "user", "content": prompt}],
                 response_format={"type": "json_object"}, temperature=0.5,
-                max_tokens=4096,
+                max_tokens=max_tokens,
             )
             return LLMClient._parse_json_response(response)
         except Exception as error:
@@ -803,6 +810,7 @@ Simulation Requirements: {simulation_requirement}
 
 ## Task
 Generate activity configuration for each entity, noting:
+- Return exactly {len(entity_list)} agent_configs objects, with numeric agent_id values {json.dumps([row['agent_id'] for row in entity_list])} exactly once each. Do not create additional agents or include explanations.
 - **Time follows the target audience's daily rhythm**: The UTC+8 example below is a reference; adjust it to the simulation scenario
 - **Official institutions** (University/GovernmentAgency): Low activity (0.1-0.3), active during work hours (9-17), slow response (60-240 min), high influence (2.5-3.0)
 - **Media** (MediaOutlet): Medium activity (0.4-0.6), active all day (8-23), fast response (5-30 min), high influence (2.0-2.5)
@@ -813,7 +821,7 @@ Return JSON format (no markdown):
 {{
     "agent_configs": [
         {{
-            "agent_id": <must match input>,
+            "agent_id": {start_idx},
             "activity_level": <0.0-1.0>,
             "posts_per_hour": <posting frequency>,
             "comments_per_hour": <comment frequency>,
@@ -823,15 +831,14 @@ Return JSON format (no markdown):
             "sentiment_bias": <-1.0 to 1.0>,
             "stance": "<supportive/opposing/neutral/observer>",
             "influence_weight": <influence weight>
-        }},
-        ...
+        }}
     ]
 }}"""
 
         system_prompt = "You are a social media behavior analysis expert. Return pure JSON. The configuration must follow the target audience's daily rhythm for the simulation scenario."
         system_prompt = f"{system_prompt}\n\n{get_language_instruction()}\nIMPORTANT: The 'stance' field value MUST be one of the English strings: 'supportive', 'opposing', 'neutral', 'observer'. All JSON field names and numeric values must remain unchanged. Only natural language text fields should use the specified language."
 
-        result = self._call_llm_with_retry(prompt, system_prompt)
+        result = self._call_llm_with_retry(prompt, system_prompt, max_tokens=self.agent_max_tokens)
         rows = result.get("agent_configs")
         expected_ids = set(range(start_idx, start_idx + len(entities)))
         if (not isinstance(rows, list) or len(rows) != len(entities)

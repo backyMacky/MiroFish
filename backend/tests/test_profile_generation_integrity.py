@@ -164,6 +164,37 @@ def test_configuration_truncation_and_missing_agent_are_not_success(generator, m
     monkeypatch.setattr(config_module, "create_chat_completion", lambda *_a, **_k: completion(truncated=True))
     with pytest.raises(RuntimeError, match="AI simulation configuration failed"):
         config._generate_time_config("context", 1)
-    monkeypatch.setattr(config, "_call_llm_with_retry", lambda *_a: {"agent_configs": []})
+    monkeypatch.setattr(config, "_call_llm_with_retry", lambda *_a, **_k: {"agent_configs": []})
     with pytest.raises(RuntimeError, match="omitted or duplicated"):
         config._generate_agent_configs_batch("context", [entity("Avery")], 0, "requirement")
+
+
+@pytest.mark.parametrize("variable,value", [
+    ("SIMULATION_AGENTS_PER_BATCH", "0"),
+    ("SIMULATION_AGENTS_PER_BATCH", "33"),
+    ("SIMULATION_AGENT_MAX_TOKENS", "255"),
+    ("SIMULATION_AGENT_MAX_TOKENS", "32769"),
+])
+def test_configuration_rejects_invalid_request_limits(monkeypatch, variable, value):
+    monkeypatch.setenv(variable, value)
+    with pytest.raises(ValueError, match=variable):
+        config_module.SimulationConfigGenerator(api_key="synthetic")
+
+
+def test_single_agent_configuration_passes_output_limit_to_provider(monkeypatch):
+    monkeypatch.setenv("SIMULATION_AGENTS_PER_BATCH", "1")
+    monkeypatch.setenv("SIMULATION_AGENT_MAX_TOKENS", "512")
+    config = config_module.SimulationConfigGenerator(api_key="synthetic")
+    calls = []
+
+    def answer(*_args, **kwargs):
+        calls.append(kwargs)
+        response = completion()
+        response.choices[0].message.content = json.dumps({"agent_configs": [{"agent_id": 7}]})
+        return response
+
+    monkeypatch.setattr(config_module, "create_chat_completion", answer)
+    result = config._generate_agent_configs_batch("context", [entity("Avery")], 7, "requirement")
+    assert config.AGENTS_PER_BATCH == 1
+    assert [row.agent_id for row in result] == [7]
+    assert calls[0]["max_tokens"] == 512
