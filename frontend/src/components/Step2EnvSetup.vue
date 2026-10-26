@@ -1,6 +1,9 @@
 <template>
   <div class="env-setup-panel">
     <div class="scroll-container">
+      <div v-if="preparedRunWarning" class="prepare-warning" role="status">
+        {{ $t('step2.previousRunFailed') }}
+      </div>
       <div v-if="prepareError" class="prepare-error" role="alert">
         <p>{{ prepareError }}</p>
         <button type="button" @click="startPrepareSimulation">{{ $t('common.retry') }}</button>
@@ -665,6 +668,7 @@ const emit = defineEmits(['go-back', 'next-step', 'add-log', 'update-status'])
 // State
 const phase = ref(0) // 0: 初始化, 1: 生成人设, 2: 生成配置, 3: 完成
 const prepareError = ref('')
+const preparedRunWarning = ref(false)
 let prepareRequestPending = false
 let preparePollEpoch = 0
 let prepareReadFailures = 0
@@ -807,6 +811,7 @@ const startPrepareSimulation = async () => {
   // 标记第一步完成，开始第二步
   prepareRequestPending = true
   prepareError.value = ''
+  preparedRunWarning.value = false
   prepareReadFailures = 0
   stopPolling()
   stopProfilesPolling()
@@ -1089,12 +1094,10 @@ const loadPreparedData = async () => {
     if (res.success && res.data) {
       const configState = res.data
 
-      if (configState.status === 'failed' || configState.error) {
-        handlePrepareFailure(configState.error)
-        return
-      }
-
       if (configState.config_generated && configState.config) {
+        // /prepare has confirmed these saved inputs. A later run failure
+        // belongs to Step 3 and must not masquerade as failed preparation.
+        preparedRunWarning.value = configState.status === 'failed' || Boolean(configState.error)
         simulationConfig.value = configState.config
         addLog(t('log.configLoadSuccess'))
 
@@ -1108,6 +1111,8 @@ const loadPreparedData = async () => {
         addLog(t('log.envSetupComplete'))
         phase.value = 4
         emit('update-status', 'completed')
+      } else if (configState.status === 'failed' || configState.error) {
+        handlePrepareFailure(configState.error)
       } else if (configState.is_generating) {
         addLog(t('log.configGenerating'))
         startConfigPolling()
@@ -1156,6 +1161,7 @@ onUnmounted(() => {
 }
 
 .prepare-error { border: 1px solid #b91c1c; border-radius: 8px; padding: 16px; color: #991b1b; background: #fff1f2; }
+.prepare-warning { border: 1px solid #d97706; border-radius: 8px; padding: 12px; color: #92400e; background: #fffbeb; }
 .prepare-error button { padding: 8px 16px; cursor: pointer; }
 
 .scroll-container {

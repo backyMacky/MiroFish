@@ -100,6 +100,7 @@
     "createSimulationException": "Simulation creation error: {error}"
   },
   "step2": {
+    "previousRunFailed": "Prepared inputs are intact. The previous run failed; use Restart on the Run screen to try again.",
     "simInstanceInit": "Simulation Instance Initialization",
     "simInstanceDesc": "Create a new simulation instance and pull world parameter templates",
     "asyncTaskDone": "Async task completed",
@@ -185,7 +186,7 @@
     "startingDualSim": "Connecting to dual-platform simulation...",
     "graphMemoryUpdateEnabled": "Dynamic graph memory update enabled",
     "setMaxRounds": "Max simulation rounds set to: {rounds}",
-    "oldSimCleared": "Old simulation logs cleared, restarting simulation",
+    "oldSimCleared": "Previous run archived; restarting simulation",
     "engineStarted": "Connected to simulation engine",
     "startFailed": "Start failed: {error}",
     "startException": "Start error: {error}",
@@ -532,7 +533,7 @@
     "startingDualSim": "Connecting to dual-platform simulation...",
     "setMaxRounds": "Max simulation rounds set to: {rounds}",
     "graphMemoryUpdateEnabled": "Dynamic graph memory update enabled",
-    "oldSimCleared": "✓ Old simulation logs cleared, restarting simulation",
+    "oldSimCleared": "✓ Previous run archived; restarting simulation",
     "engineStarted": "✓ Connected to simulation engine",
     "startFailed": "✗ Start failed: {error}",
     "startException": "✗ Start error: {error}",

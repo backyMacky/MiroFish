@@ -100,6 +100,7 @@
     "createSimulationException": "创建模拟异常: {error}"
   },
   "step2": {
+    "previousRunFailed": "准备数据完好。上一次模拟运行失败，请在运行页面使用“重新开始”重试。",
     "simInstanceInit": "模拟实例初始化",
     "simInstanceDesc": "新建simulation实例，拉取模拟世界参数模版",
     "asyncTaskDone": "异步任务已完成",
@@ -185,7 +186,7 @@
     "startingDualSim": "正在连接双平台并行模拟...",
     "graphMemoryUpdateEnabled": "已开启动态图谱更新模式",
     "setMaxRounds": "设置最大模拟轮数: {rounds}",
-    "oldSimCleared": "已清理旧的模拟日志，重新开始模拟",
+    "oldSimCleared": "已归档上一次运行，重新开始模拟",
     "engineStarted": "已连接模拟引擎",
     "startFailed": "启动失败: {error}",
     "startException": "启动异常: {error}",
@@ -532,7 +533,7 @@
     "startingDualSim": "正在连接双平台并行模拟...",
     "setMaxRounds": "设置最大模拟轮数: {rounds}",
     "graphMemoryUpdateEnabled": "已开启动态图谱更新模式",
-    "oldSimCleared": "✓ 已清理旧的模拟日志，重新开始模拟",
+    "oldSimCleared": "✓ 已归档上一次运行，重新开始模拟",
     "engineStarted": "✓ 已连接模拟引擎",
     "startFailed": "✗ 启动失败: {error}",
     "startException": "✗ 启动异常: {error}",
