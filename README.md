@@ -195,6 +195,8 @@ For a single CPU inference server, set `LLM_MAX_CONCURRENT_REQUESTS=1` and choos
 measured throughput. Preparation and ontology work expose background task IDs.
 Reload reconnects to existing work; an explicit simulation restart archives the
 previous run. Model errors remain visible instead of producing fallback success.
+Closing the interview environment preserves the runner's completion or failure
+result; closing a process cannot acknowledge unfinished graph ingestion.
 
 ## 📬 Join the Conversation
 

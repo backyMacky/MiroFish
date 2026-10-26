@@ -2904,12 +2904,8 @@ def close_simulation_env():
             timeout=timeout
         )
         
-        # 更新模拟状态
-        manager = SimulationManager()
-        state = manager.get_simulation(simulation_id)
-        if state:
-            state.status = SimulationStatus.COMPLETED
-            manager._save_simulation_state(state)
+        # Environment lifetime is independent of run completion. The runner's
+        # graph-ingestion barrier owns terminal status, including failures.
         
         return jsonify({
             "success": result.get("success", False),

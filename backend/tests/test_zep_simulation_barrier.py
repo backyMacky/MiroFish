@@ -18,6 +18,32 @@ from app.services.simulation_runner import (
 )
 
 
+@pytest.mark.parametrize('closed', [True, False])
+@pytest.mark.parametrize('status', [SimulationStatus.FAILED, SimulationStatus.STOPPING, SimulationStatus.COMPLETED])
+def test_close_environment_preserves_run_result(monkeypatch, closed, status):
+    state = SimpleNamespace(status=status, error='retained ingestion diagnostic')
+    saved = []
+    monkeypatch.setattr(
+        simulation_api, 'SimulationManager',
+        lambda: SimpleNamespace(
+            get_simulation=lambda _identifier: state,
+            _save_simulation_state=lambda value: saved.append(value.status),
+        ),
+    )
+    monkeypatch.setattr(
+        SimulationRunner, 'close_simulation_env',
+        classmethod(lambda _cls, simulation_id, **_kwargs: {'success': closed}),
+    )
+    app = Flask(__name__)
+    app.register_blueprint(simulation_api.simulation_bp, url_prefix='/simulation')
+    response = app.test_client().post('/simulation/close-env', json={'simulation_id': 'sim-close'})
+    assert response.status_code == 200
+    assert response.json['success'] is closed
+    assert state.status == status
+    assert state.error == 'retained ingestion diagnostic'
+    assert saved == []
+
+
 def test_finished_loops_drain_while_real_interview_process_stays_alive(monkeypatch, tmp_path):
     """The process deliberately waits for IPC after its producer-end receipt."""
     simulation_id = 'sim-live-environment'
