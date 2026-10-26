@@ -448,6 +448,17 @@ const selectedAgents = ref(new Set())
 const surveyQuestion = ref('')
 const surveyResults = ref([])
 const isSurveying = ref(false)
+let disposed = false
+const interviewControllers = new Set()
+const requestInterviews = async (data) => {
+  const controller = new AbortController()
+  interviewControllers.add(controller)
+  try {
+    return await interviewAgents(data, controller.signal)
+  } finally {
+    interviewControllers.delete(controller)
+  }
+}
 
 // Report Data
 const reportOutline = ref(null)
@@ -580,6 +591,7 @@ const sendMessage = async () => {
       await sendToAgent(message)
     }
   } catch (err) {
+    if (disposed) return
     addLog(t('log.sendFailed', { error: err.message }))
     chatHistory.value.push({
       role: 'assistant',
@@ -587,10 +599,11 @@ const sendMessage = async () => {
       timestamp: new Date().toISOString()
     })
   } finally {
-    isSending.value = false
-    scrollToBottom()
-    // 自动保存对话记录到缓存
-    saveChatHistory()
+    if (!disposed) {
+      isSending.value = false
+      scrollToBottom()
+      saveChatHistory()
+    }
   }
 }
 
@@ -642,7 +655,7 @@ const sendToAgent = async (message) => {
     prompt = `以下是我们之前的对话：\n${historyContext}\n\n现在我的新问题是：${message}`
   }
   
-  const res = await interviewAgents({
+  const res = await requestInterviews({
     simulation_id: props.simulationId,
     interviews: [{
       agent_id: selectedAgentIndex.value,
@@ -729,7 +742,7 @@ const submitSurvey = async () => {
       prompt: surveyQuestion.value.trim()
     }))
     
-    const res = await interviewAgents({
+    const res = await requestInterviews({
       simulation_id: props.simulationId,
       interviews: interviews
     })
@@ -780,9 +793,10 @@ const submitSurvey = async () => {
       throw new Error(res.error || t('step5.requestFailed'))
     }
   } catch (err) {
+    if (disposed) return
     addLog(t('log.surveySendFailed', { error: err.message }))
   } finally {
-    isSurveying.value = false
+    if (!disposed) isSurveying.value = false
   }
 }
 
@@ -860,6 +874,8 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+  disposed = true
+  for (const controller of interviewControllers) controller.abort()
   document.removeEventListener('click', handleClickOutside)
 })
 

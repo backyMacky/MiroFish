@@ -18,6 +18,7 @@ from datetime import datetime
 from enum import Enum
 
 from ..utils.logger import get_logger
+from ..utils.fileio import atomic_write_json
 
 logger = get_logger('mirofish.simulation_ipc')
 
@@ -114,6 +115,45 @@ class SimulationIPCClient:
         os.makedirs(self.commands_dir, exist_ok=True)
         os.makedirs(self.responses_dir, exist_ok=True)
     
+    def submit_command(self, command_type: CommandType, args: Dict[str, Any]) -> str:
+        """Publish once; durable responses can be read across HTTP requests."""
+        command_id = str(uuid.uuid4())
+        command = IPCCommand(command_id=command_id, command_type=command_type, args=args)
+        atomic_write_json(os.path.join(self.commands_dir, f'{command_id}.request'), command.to_dict())
+        atomic_write_json(os.path.join(self.commands_dir, f'{command_id}.json'), command.to_dict())
+        return command_id
+
+    def read_request(self, command_id: str) -> IPCCommand:
+        if str(uuid.UUID(command_id)) != command_id:
+            raise ValueError('Invalid command identifier')
+        try:
+            with open(os.path.join(self.commands_dir, f'{command_id}.request'), encoding='utf-8') as source:
+                command = IPCCommand.from_dict(json.load(source))
+            if command.command_id != command_id:
+                raise ValueError('Interview request identifier mismatch')
+            return command
+        except (OSError, json.JSONDecodeError, KeyError) as error:
+            raise ValueError('Interview request receipt unavailable') from error
+
+    def read_command(self, command_id: str) -> Dict[str, Any]:
+        if str(uuid.UUID(command_id)) != command_id:
+            raise ValueError('Invalid command identifier')
+        response_file = os.path.join(self.responses_dir, f'{command_id}.json')
+        command_file = os.path.join(self.commands_dir, f'{command_id}.json')
+        try:
+            with open(response_file, encoding='utf-8') as source:
+                response = IPCResponse.from_dict(json.load(source))
+            if response.command_id != command_id:
+                raise ValueError('Interview response identifier mismatch')
+            return response.to_dict()
+        except (FileNotFoundError, json.JSONDecodeError):
+            # The existing OASIS process may still be publishing its response.
+            if os.path.exists(command_file) or os.path.exists(response_file):
+                return {'command_id': command_id, 'status': 'pending'}
+            raise ValueError('Interview command not found')
+        except (KeyError, TypeError) as error:
+            raise ValueError('Invalid interview response') from error
+
     def send_command(
         self,
         command_type: CommandType,

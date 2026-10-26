@@ -197,6 +197,12 @@ Reload reconnects to existing work; an explicit simulation restart archives the
 previous run. Model errors remain visible instead of producing fallback success.
 Closing the interview environment preserves the runner's completion or failure
 result; closing a process cannot acknowledge unfinished graph ingestion.
+The interactive UI submits interviews and surveys as filesystem-backed commands
+and polls their results with short reads. Responses and request receipts survive
+HTTP disconnects; polling never resubmits inference. The command wait bound is
+`INTERVIEW_COMMAND_TIMEOUT_SECONDS` (default 3,600, range 1–7,200 seconds).
+Expiry leaves the command available for review; it does not claim cancellation.
+Missing actor/platform responses cannot acknowledge a successful interview.
 
 ## 📬 Join the Conversation
 

@@ -2547,6 +2547,8 @@ def interview_agents_batch():
                 "error": t('api.requireInterviews')
             }), 400
 
+        SimulationRunner.interview_command_client(simulation_id)
+
         # 验证platform参数
         if platform and platform not in ("twitter", "reddit"):
             return jsonify({
@@ -2556,6 +2558,8 @@ def interview_agents_batch():
 
         # 验证每个采访项
         for i, interview in enumerate(interviews):
+            if not isinstance(interview, dict):
+                return jsonify({'success': False, 'error': 'Interview entries must be objects'}), 400
             if 'agent_id' not in interview:
                 return jsonify({
                     "success": False,
@@ -2566,6 +2570,10 @@ def interview_agents_batch():
                     "success": False,
                     "error": t('api.interviewListMissingPrompt', index=i+1)
                 }), 400
+            if type(interview['agent_id']) is not int or interview['agent_id'] < 0:
+                return jsonify({'success': False, 'error': 'Agent identifiers must be nonnegative integers'}), 400
+            if not isinstance(interview['prompt'], str) or not interview['prompt'].strip():
+                return jsonify({'success': False, 'error': 'Interview prompts must be nonempty text'}), 400
             # 验证每项的platform（如果有）
             item_platform = interview.get('platform')
             if item_platform and item_platform not in ("twitter", "reddit"):
@@ -2587,6 +2595,11 @@ def interview_agents_batch():
             optimized_interview = interview.copy()
             optimized_interview['prompt'] = optimize_interview_prompt(interview.get('prompt', ''))
             optimized_interviews.append(optimized_interview)
+
+        if data.get('async') is True:
+            return jsonify({'success': True, 'data': SimulationRunner.submit_interview_batch(
+                simulation_id, optimized_interviews, platform,
+            )}), 202
 
         result = SimulationRunner.interview_agents_batch(
             simulation_id=simulation_id,
@@ -2619,6 +2632,14 @@ def interview_agents_batch():
             "error": str(e),
             "traceback": traceback.format_exc()
         }), 500
+
+
+@simulation_bp.route('/interview/status/<simulation_id>/<command_id>', methods=['GET'])
+def interview_command_status(simulation_id, command_id):
+    try:
+        return jsonify({'success': True, 'data': SimulationRunner.read_interview_command(simulation_id, command_id)})
+    except ValueError as error:
+        return jsonify({'success': False, 'error': str(error)}), 400
 
 
 @simulation_bp.route('/interview/all', methods=['POST'])

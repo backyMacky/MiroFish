@@ -1,4 +1,5 @@
 import service from './index'
+import { waitForTask } from './taskPolling'
 
 /**
  * 创建模拟
@@ -174,8 +175,14 @@ export const getEnvStatus = (data) => {
  * 批量采访 Agent
  * @param {Object} data - { simulation_id, interviews: [{ agent_id, prompt }] }
  */
-export const interviewAgents = (data) => {
-  return service.post('/api/simulation/interview/batch', data)
+export const interviewAgents = async (data, signal) => {
+  const response = await service.post('/api/simulation/interview/batch', { ...data, async: true }, { signal })
+  const commandId = response?.data?.command_id
+  if (!response?.success || !commandId) throw new Error('Interview command was not accepted')
+  return waitForTask(
+    signal => service.get(`/api/simulation/interview/status/${encodeURIComponent(data.simulation_id)}/${encodeURIComponent(commandId)}`, { signal }),
+    { signal },
+  )
 }
 
 /**

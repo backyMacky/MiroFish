@@ -4,6 +4,8 @@ OASIS模拟运行器
 """
 
 import os
+import re
+import math
 import sys
 import json
 import time
@@ -1413,14 +1415,15 @@ class SimulationRunner:
             return {"success": True, "cleaned_files": []}
         archive = directory / 'run_attempts' / uuid.uuid4().hex
         names = ['run_state.json', 'simulation.log', 'stdout.log', 'stderr.log',
-                 'env_status.json', 'twitter/actions.jsonl', 'reddit/actions.jsonl']
+                 'env_status.json', 'twitter/actions.jsonl', 'reddit/actions.jsonl',
+                 'ipc_commands', 'ipc_responses']
         for platform in ('twitter', 'reddit'):
             names.extend(platform + '_simulation.db' + suffix for suffix in ('', '-wal', '-shm'))
         moved = []
         errors = []
         for name in names:
             source = directory / name
-            if source.is_file():
+            if source.is_file() or source.is_dir():
                 try:
                     destination = archive / name
                     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -1627,6 +1630,67 @@ class SimulationRunner:
         return running
     
     # ============== Interview 功能 ==============
+
+    @classmethod
+    def interview_command_client(cls, simulation_id):
+        if not isinstance(simulation_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]+', simulation_id):
+            raise ValueError('Invalid simulation identifier')
+        directory = os.path.join(cls.RUN_STATE_DIR, simulation_id)
+        if not os.path.isdir(directory):
+            raise ValueError('Simulation not found')
+        return SimulationIPCClient(directory)
+
+    @classmethod
+    def submit_interview_batch(cls, simulation_id, interviews, platform=None):
+        client = cls.interview_command_client(simulation_id)
+        if not client.check_env_alive():
+            raise ValueError('Simulation environment is not running')
+        args = {'interviews': interviews}
+        if platform:
+            args['platform'] = platform
+        timeout = float(os.getenv('INTERVIEW_COMMAND_TIMEOUT_SECONDS', '3600'))
+        if not math.isfinite(timeout) or not 1 <= timeout <= 7200:
+            raise ValueError('Interview command timeout must be from 1 to 7200 seconds')
+        detail = cls.get_env_status_detail(simulation_id)
+        active = [name for name in ('twitter', 'reddit') if detail.get(f'{name}_available')]
+        args['_expected_keys'] = [
+            f'{name}_{item["agent_id"]}' for item in interviews
+            for name in ([item.get('platform', platform)] if item.get('platform', platform) else active)
+        ]
+        args['_deadline_epoch'] = time.time() + timeout
+        command_id = client.submit_command(CommandType.BATCH_INTERVIEW, args)
+        return {'command_id': command_id, 'status': 'pending'}
+
+    @classmethod
+    def read_interview_command(cls, simulation_id, command_id):
+        client = cls.interview_command_client(simulation_id)
+        response = client.read_command(command_id)
+        receipt = client.read_request(command_id)
+        status = response['status']
+        if status in {'pending', 'processing'}:
+            if time.time() > receipt.args['_deadline_epoch']:
+                return {'status': 'failed', 'error': 'Interview deadline exceeded; command retained for review'}
+            if not client.check_env_alive():
+                return {'status': 'failed', 'error': 'Simulation environment closed before responding'}
+            return response
+        if status == 'failed':
+            return response
+        if status != 'completed' or not isinstance(response.get('result'), dict):
+            raise ValueError('Invalid interview response')
+        results = response['result'].get('results')
+        expected = set(receipt.args['_expected_keys'])
+        ids = {item['agent_id'] for item in receipt.args['interviews']}
+        if (not isinstance(results, dict) or not results
+                or any(not isinstance(row, dict) or type(row.get('agent_id')) is not int
+                       or not isinstance(row.get('response'), str)
+                       or not row['response'].strip() for row in results.values())
+                or {row.get('agent_id') for row in results.values()} != ids
+                or (expected and set(results) != expected)):
+            raise ValueError('Interview result is missing requested agent or platform responses')
+        return {
+            'command_id': command_id, 'status': 'completed',
+            'result': {'success': True, 'result': response['result'], 'timestamp': response['timestamp']},
+        }
     
     @classmethod
     def check_env_alive(cls, simulation_id: str) -> bool:
