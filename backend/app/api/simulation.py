@@ -1025,6 +1025,8 @@ def get_simulation_history():
             
             # 获取关联项目的文件列表（最多3个）
             project = ProjectManager.get_project(sim.project_id)
+            if project and not sim_dict["simulation_requirement"]:
+                sim_dict["simulation_requirement"] = project.simulation_requirement or ""
             if project and hasattr(project, 'files') and project.files:
                 sim_dict["files"] = [
                     {"filename": f.get("filename", "未知文件")} 
