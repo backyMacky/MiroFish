@@ -36,6 +36,33 @@ def entity(name):
     )
 
 
+@pytest.mark.parametrize(
+    "entity_type, individual",
+    [
+        ("ProcurementDirector", True),
+        ("SupplierAccountManager", True),
+        ("ChiefFinancialOfficer", True),
+        ("GraduateStudent", True),
+        ("CommunityRepresentative", True),
+        ("TaxLawyer", True),
+        ("ResearchScientist", True),
+        ("HumanResourcesCoordinator", True),
+        ("Person", True),
+        ("ProcurementDepartment", False),
+        ("BoardOfDirectors", False),
+        ("CommunityOrganization", False),
+        ("Directorate", False),
+        ("ResearchUniversity", False),
+        ("GovernmentAgency", False),
+        ("PersonalityResearchGroup", False),
+    ],
+)
+def test_custom_occupational_types_use_personas_instead_of_corporate_accounts(
+    generator, entity_type, individual
+):
+    assert generator._is_individual_entity(entity_type) is individual
+
+
 def completion(*, truncated=False):
     return SimpleNamespace(
         choices=[

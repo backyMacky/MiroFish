@@ -238,6 +238,16 @@ class OasisProfileGenerator:
         "student", "alumni", "professor", "person", "publicfigure", 
         "expert", "faculty", "official", "journalist", "activist"
     ]
+
+    # Generated ontologies use specific occupational types as well as Person.
+    # Match role heads, so ProcurementDirector is a person while Directorate
+    # and BoardOfDirectors remain organizations.
+    INDIVIDUAL_ROLE_SUFFIXES = (
+        "director", "manager", "officer", "representative", "buyer", "analyst",
+        "engineer", "researcher", "scientist", "lawyer", "attorney", "advisor",
+        "consultant", "specialist", "coordinator", "founder", "developer",
+        "teacher", "physician", "doctor", "nurse", "ceo", "cfo", "cto",
+    )
     
     # 群体/机构类型实体（需要生成群体代表人设）
     GROUP_ENTITY_TYPES = [
@@ -550,7 +560,10 @@ class OasisProfileGenerator:
     
     def _is_individual_entity(self, entity_type: str) -> bool:
         """判断是否是个人类型实体"""
-        return entity_type.lower() in self.INDIVIDUAL_ENTITY_TYPES
+        normalized = "".join(character for character in entity_type.lower() if character.isalnum())
+        return normalized.endswith(
+            tuple(self.INDIVIDUAL_ENTITY_TYPES) + self.INDIVIDUAL_ROLE_SUFFIXES
+        )
     
     def _is_group_entity(self, entity_type: str) -> bool:
         """判断是否是群体/机构类型实体"""
@@ -701,7 +714,11 @@ class OasisProfileGenerator:
     def _get_system_prompt(self, is_individual: bool) -> str:
         """获取系统提示词"""
         base_prompt = "你是社交媒体用户画像生成专家。生成详细、真实的人设用于舆论模拟,最大程度还原已有现实情况。必须返回有效的JSON格式，所有字符串值不能包含未转义的换行符。"
-        return f"{base_prompt}\n\n{get_language_instruction()}"
+        return (
+            f"{base_prompt}\n\n{get_language_instruction()}\n"
+            f"Keep bio within 180 characters and persona within {self.persona_characters} "
+            "characters, including spaces. Keep details concise and preserve the source role."
+        )
     
     def _build_individual_persona_prompt(
         self,
