@@ -19,7 +19,7 @@ service.interceptors.request.use(
     return config
   },
   error => {
-    console.error('Request error:', error)
+    if (!axios.isCancel(error)) console.error('Request failed', { code: error.code })
     return Promise.reject(error)
   }
 )
@@ -31,14 +31,16 @@ service.interceptors.response.use(
     
     // 如果返回的状态码不是success，则抛出错误
     if (!res.success && res.success !== undefined) {
-      console.error('API Error:', res.error || res.message || 'Unknown error')
+      console.error('API reported failure')
       return Promise.reject(new Error(res.error || res.message || 'Error'))
     }
     
     return res
   },
   error => {
-    console.error('Response error:', error)
+    if (axios.isCancel(error)) return Promise.reject(error)
+    // Axios errors contain headers, request payloads and provider response bodies.
+    console.error('API request failed', { code: error.code, status: error.response?.status })
     const apiError = error.response?.data?.error || error.response?.data?.message
     
     // 处理超时
