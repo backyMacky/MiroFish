@@ -50,7 +50,7 @@
           :graphData="graphData"
           :loading="graphLoading"
           :canRefresh="Boolean(projectData?.graph_id)"
-          :currentPhase="currentPhase"
+          :currentPhase="error ? -1 : currentPhase"
           @refresh="refreshGraph"
           @toggle-maximize="toggleMaximize('graph')"
         />
