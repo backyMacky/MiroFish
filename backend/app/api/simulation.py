@@ -340,7 +340,7 @@ def _check_simulation_prepared(simulation_id: str) -> tuple:
         # - completed: 运行完成，说明准备早就完成了
         # - stopped: 已停止，说明准备早就完成了
         # - failed: 运行失败（但准备是完成的）
-        prepared_statuses = ["ready", "preparing", "running", "completed", "stopped", "failed"]
+        prepared_statuses = ["ready", "preparing", "running", "stopping", "completed", "stopped", "failed"]
         if status in prepared_statuses and config_generated:
             # 获取文件统计信息
             profiles_file = os.path.join(simulation_dir, "reddit_profiles.json")
@@ -358,8 +358,8 @@ def _check_simulation_prepared(simulation_id: str) -> tuple:
                     state_data["status"] = "ready"
                     from datetime import datetime
                     state_data["updated_at"] = datetime.now().isoformat()
-                    with open(state_file, 'w', encoding='utf-8') as f:
-                        json.dump(state_data, f, ensure_ascii=False, indent=2)
+                    from ..utils.fileio import atomic_write_json
+                    atomic_write_json(state_file, state_data)
                     logger.info(f"自动更新模拟状态: {simulation_id} preparing -> ready")
                     status = "ready"
                 except Exception as e:
@@ -467,7 +467,8 @@ def _prepare_simulation_impl():
                 "error": t('api.simulationNotFound', id=simulation_id)
             }), 404
 
-        if state.status in {SimulationStatus.RUNNING, SimulationStatus.STOPPING}:
+        if (state.status in {SimulationStatus.RUNNING, SimulationStatus.STOPPING}
+                and data.get('force_regenerate', False)):
             return jsonify({"success": False, "error": "Stop the running simulation before preparing it again"}), 409
 
         # Reuse the active job even when a client asks to regenerate. A second
@@ -509,6 +510,11 @@ def _prepare_simulation_impl():
             else:
                 logger.info(f"模拟 {simulation_id} 未准备完成，将启动准备任务")
         
+        # A setup visit may read confirmed preparation while a run is active.
+        # Missing preparation still cannot start a competing writer.
+        if state.status in {SimulationStatus.RUNNING, SimulationStatus.STOPPING}:
+            return jsonify({"success": False, "error": "Stop the running simulation before preparing it again"}), 409
+
         # 从项目获取必要信息
         project = ProjectManager.get_project(state.project_id)
         if not project:

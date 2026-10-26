@@ -795,8 +795,9 @@ const selectProfile = (profile) => {
 }
 
 // 自动开始准备模拟
+const preparationController = new AbortController()
 const startPrepareSimulation = async () => {
-  if (prepareRequestPending) return
+  if (prepareRequestPending || preparationController.signal.aborted) return
   if (!props.simulationId) {
     addLog(t('log.errorMissingSimId'))
     emit('update-status', 'error')
@@ -821,6 +822,7 @@ const startPrepareSimulation = async () => {
       use_llm_for_profiles: true,
       parallel_profile_count: 5
     })
+    if (preparationController.signal.aborted) return
     
     if (res.success && res.data) {
       if (res.data.already_prepared) {
@@ -851,7 +853,7 @@ const startPrepareSimulation = async () => {
       handlePrepareFailure(res.error)
     }
   } catch (err) {
-    handlePrepareFailure(err.message)
+    if (!preparationController.signal.aborted) handlePrepareFailure(err.message)
   } finally {
     prepareRequestPending = false
   }
@@ -1137,6 +1139,7 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+  preparationController.abort()
   stopPolling()
   stopProfilesPolling()
   stopConfigPolling()

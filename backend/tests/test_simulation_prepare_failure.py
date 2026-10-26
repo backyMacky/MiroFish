@@ -32,6 +32,48 @@ def _write_failed_state(root, simulation_id="sim_failed"):
     return simulation_id
 
 
+@pytest.mark.parametrize("status", [SimulationStatus.RUNNING, SimulationStatus.STOPPING])
+@pytest.mark.parametrize("prepared", [False, True])
+@pytest.mark.parametrize("force", [False, True])
+def test_active_setup_reads_preserve_run_and_cannot_launch_regeneration(
+    tmp_path, monkeypatch, status, prepared, force
+):
+    from flask import Flask
+    from app.api import simulation as simulation_api
+
+    monkeypatch.setattr(Config, "OASIS_SIMULATION_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(SimulationManager, "SIMULATION_DATA_DIR", str(tmp_path))
+    simulation_id = f"sim_setup_view_{status.value}_{prepared}_{force}"
+    state = SimulationState(
+        simulation_id=simulation_id,
+        project_id="synthetic_project",
+        graph_id="synthetic_graph",
+        status=status,
+        profiles_generated=True,
+        config_generated=True,
+    )
+    SimulationManager()._save_simulation_state(state)
+    root = tmp_path / simulation_id
+    if prepared:
+        (root / "reddit_profiles.json").write_text('[{"name":"Avery"}]', encoding="utf-8")
+        (root / "twitter_profiles.csv").write_text("user_id,name\n0,Avery\n", encoding="utf-8")
+        (root / "simulation_config.json").write_text("{}", encoding="utf-8")
+    before = {path.name: path.read_bytes() for path in root.iterdir() if path.is_file()}
+    app = Flask(__name__)
+    app.register_blueprint(simulation_api.simulation_bp, url_prefix="/api/simulation")
+    response = app.test_client().post(
+        "/api/simulation/prepare",
+        json={"simulation_id": simulation_id, "force_regenerate": force},
+    )
+    if prepared and not force:
+        assert response.status_code == 200
+        assert response.json["data"]["already_prepared"] is True
+    else:
+        assert response.status_code == 409
+    assert {path.name: path.read_bytes() for path in root.iterdir() if path.is_file()} == before
+    assert not (root / "preparation_attempts").exists()
+
+
 def test_realtime_endpoints_expose_terminal_failure(tmp_path, monkeypatch):
     simulation_id = _write_failed_state(tmp_path)
     monkeypatch.setattr(Config, "OASIS_SIMULATION_DATA_DIR", str(tmp_path))
