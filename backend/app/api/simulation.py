@@ -1654,9 +1654,16 @@ def start_simulation():
             }), 404
 
         force_restarted = False
+
+        previous_run = SimulationRunner.has_run_artifacts(simulation_id)
+        if previous_run and not force:
+            return jsonify({
+                'success': False,
+                'error': 'Previous run data exists. Use Restart to archive it before starting a new run.',
+            }), 409
         
         # 智能处理状态：如果准备工作已完成，允许重新启动
-        if state.status != SimulationStatus.READY:
+        if state.status != SimulationStatus.READY or (force and previous_run):
             # 检查准备工作是否已完成
             is_prepared, prepare_info = _check_simulation_prepared(simulation_id)
 
@@ -1692,7 +1699,7 @@ def start_simulation():
                         }), 400
                     logger.info(f"强制模式：先完成旧模拟终止 {simulation_id}")
                     try:
-                        stopped = SimulationRunner.stop_simulation(simulation_id)
+                        stopped = SimulationRunner.request_stop(simulation_id)
                     except SimulationStopPending as error:
                         return jsonify({
                             "success": False,
@@ -1747,6 +1754,11 @@ def start_simulation():
             project = ProjectManager.get_project(state.project_id)
             graph_id = project.graph_id if project else None
             if not graph_id:
+                if state.graph_id:
+                    return jsonify({
+                        'success': False,
+                        'error': 'The project graph was reset or deleted; refresh and prepare the simulation again.',
+                    }), 409
                 return jsonify({
                     "success": False,
                     "error": t('api.graphIdRequiredForMemory')
@@ -1876,7 +1888,7 @@ def stop_simulation():
                 "error": t('api.requireSimulationId')
             }), 400
         
-        run_state = SimulationRunner.stop_simulation(simulation_id, wait_timeout=1.0)
+        run_state = SimulationRunner.request_stop(simulation_id, wait_timeout=1.0)
         
         # 更新模拟状态
         manager = SimulationManager()

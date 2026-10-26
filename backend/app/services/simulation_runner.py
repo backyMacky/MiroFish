@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from queue import Queue
+from concurrent.futures import Future, TimeoutError as FutureTimeout
 
 from ..config import Config
 from ..utils.logger import get_logger
@@ -227,6 +228,25 @@ class SimulationRunner:
         '../../scripts'
     )
     
+    RUN_ARTIFACT_PATHS = (
+        'run_state.json', 'simulation.log', 'stdout.log', 'stderr.log',
+        'env_status.json', 'twitter/actions.jsonl', 'reddit/actions.jsonl',
+        'ipc_commands', 'ipc_responses',
+        *(platform + '_simulation.db' + suffix
+          for platform in ('twitter', 'reddit') for suffix in ('', '-wal', '-shm')),
+    )
+
+    @classmethod
+    def has_run_artifacts(cls, simulation_id):
+        from pathlib import Path
+        if not isinstance(simulation_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]+', simulation_id):
+            raise ValueError('Invalid simulation identifier')
+        directory = Path(cls.RUN_STATE_DIR) / simulation_id
+        return any(
+            path.is_file() or (path.is_dir() and any(path.iterdir()))
+            for path in (directory / name for name in cls.RUN_ARTIFACT_PATHS)
+        )
+
     # 内存中的运行状态
     _run_states: Dict[str, SimulationRunState] = {}
     _processes: Dict[str, subprocess.Popen] = {}
@@ -240,6 +260,8 @@ class SimulationRunner:
     _finalization_locks: Dict[str, threading.Lock] = {}
     _finalization_locks_guard = threading.Lock()
     _manual_stop_requests: set[str] = set()
+    _stop_request_guard = threading.Lock()
+    _stop_requests: Dict[str, Future] = {}
 
     @classmethod
     def _finalization_lock(cls, simulation_id: str) -> threading.Lock:
@@ -398,6 +420,9 @@ class SimulationRunner:
         
         if not os.path.exists(config_path):
             raise ValueError(f"模拟配置不存在，请先调用 /prepare 接口")
+
+        if cls.has_run_artifacts(simulation_id):
+            raise ValueError('Previous run data must be archived before starting a new simulation')
         
         with open(config_path, 'r', encoding='utf-8') as f:
             config = normalize_config_hours(json.load(f))
@@ -976,6 +1001,52 @@ class SimulationRunner:
                 process.wait(timeout=5)
     
     @classmethod
+    def request_stop(cls, simulation_id: str, *, wait_timeout: float = 1.0) -> SimulationRunState:
+        """Keep HTTP waits bounded, including contention on the drain lock.
+
+        The worker owns the stop even if the caller disconnects. Concurrent
+        requests share that worker; status polling never resubmits the stop.
+        """
+        if not isinstance(simulation_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]+', simulation_id):
+            raise ValueError('Invalid simulation identifier')
+        state = cls.get_run_state(simulation_id)
+        if state is None:
+            raise ValueError(f'Simulation not found: {simulation_id}')
+        if state.runner_status == RunnerStatus.STOPPED:
+            return state
+        locale = get_locale()
+        with cls._stop_request_guard:
+            future = cls._stop_requests.get(simulation_id)
+            if future is None:
+                future = Future()
+                cls._stop_requests[simulation_id] = future
+
+                def finish_stop():
+                    set_locale(locale)
+                    try:
+                        future.set_result(cls.stop_simulation(simulation_id))
+                    except Exception as error:
+                        future.set_exception(error)
+                    finally:
+                        with cls._stop_request_guard:
+                            if cls._stop_requests.get(simulation_id) is future:
+                                cls._stop_requests.pop(simulation_id, None)
+
+                try:
+                    threading.Thread(target=finish_stop, daemon=True,
+                                     name=f'stop-{simulation_id}').start()
+                except Exception:
+                    cls._stop_requests.pop(simulation_id, None)
+                    raise
+        try:
+            return future.result(timeout=max(0.0, wait_timeout))
+        except FutureTimeout as error:
+            if future.done():
+                # A worker may itself report a bounded finalization timeout.
+                return future.result()
+            raise SimulationStopPending('Stop accepted; graph finalization is still in progress') from error
+
+    @classmethod
     def stop_simulation(cls, simulation_id: str, *, wait_timeout: float | None = None) -> SimulationRunState:
         """停止模拟"""
         with cls._finalization_lock(simulation_id):
@@ -1415,11 +1486,7 @@ class SimulationRunner:
         if not directory.exists():
             return {"success": True, "cleaned_files": []}
         archive = directory / 'run_attempts' / uuid.uuid4().hex
-        names = ['run_state.json', 'simulation.log', 'stdout.log', 'stderr.log',
-                 'env_status.json', 'twitter/actions.jsonl', 'reddit/actions.jsonl',
-                 'ipc_commands', 'ipc_responses']
-        for platform in ('twitter', 'reddit'):
-            names.extend(platform + '_simulation.db' + suffix for suffix in ('', '-wal', '-shm'))
+        names = cls.RUN_ARTIFACT_PATHS
         moved = []
         errors = []
         for name in names:

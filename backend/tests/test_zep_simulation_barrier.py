@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import threading
 import json
 import subprocess
 import sys
@@ -110,6 +111,106 @@ def test_explicit_restart_archives_previous_run_without_touching_preparation(mon
     assert not (directory / 'run_state.json').exists()
     with pytest.raises(ValueError, match='Invalid simulation directory'):
         SimulationRunner.cleanup_simulation_logs('../outside')
+
+
+@pytest.mark.parametrize('force', [False, True])
+def test_ready_setup_cannot_bypass_prior_run_archive(monkeypatch, tmp_path, force):
+    simulation_id = 'sim-ready-restart'
+    directory = tmp_path / simulation_id
+    (directory / 'twitter').mkdir(parents=True)
+    originals = {
+        'twitter/actions.jsonl': b'old simulation_end event\n',
+        'twitter_simulation.db': b'old database',
+        'twitter_simulation.db-wal': b'old wal',
+        'run_state.json': b'{"runner_status":"completed"}',
+    }
+    for name, content in originals.items():
+        (directory / name).write_bytes(content)
+    config = directory / 'simulation_config.json'
+    config.write_bytes(b'prepared config retained verbatim')
+    monkeypatch.setattr(SimulationRunner, 'RUN_STATE_DIR', str(tmp_path))
+    state = SimpleNamespace(status=SimulationStatus.READY, project_id='proj-ready')
+    monkeypatch.setattr(simulation_api, 'SimulationManager', lambda: SimpleNamespace(
+        get_simulation=lambda _id: state, _save_simulation_state=lambda _state: None))
+    monkeypatch.setattr(simulation_api, '_check_simulation_prepared', lambda _id: (True, {}))
+    monkeypatch.setattr(SimulationRunner, 'get_run_state', classmethod(lambda *_args: None))
+    monkeypatch.setattr(runner_module.ZepGraphMemoryManager, 'get_updater', classmethod(lambda *_args: None))
+    launches = []
+
+    def launch(_cls, **kwargs):
+        assert not SimulationRunner.has_run_artifacts(simulation_id)
+        archives = list((directory / 'run_attempts').iterdir())
+        assert len(archives) == 1
+        for name, content in originals.items():
+            assert (archives[0] / name).read_bytes() == content
+        assert config.read_bytes() == b'prepared config retained verbatim'
+        launches.append(kwargs)
+        return SimulationRunState(simulation_id=simulation_id)
+
+    monkeypatch.setattr(SimulationRunner, 'start_simulation', classmethod(launch))
+    app = Flask(__name__)
+    app.register_blueprint(simulation_api.simulation_bp, url_prefix='/simulation')
+    response = app.test_client().post('/simulation/start', json={
+        'simulation_id': simulation_id, 'force': force, 'enable_graph_memory_update': False})
+    if force:
+        assert response.status_code == 200, response.json
+        assert response.json['data']['force_restarted'] is True
+        assert len(launches) == 1
+    else:
+        assert response.status_code == 409
+        assert launches == []
+        assert not (directory / 'run_attempts').exists()
+        for name, content in originals.items():
+            assert (directory / name).read_bytes() == content
+
+
+def test_runner_refuses_unarchived_events_before_launch(monkeypatch, tmp_path):
+    directory = tmp_path / 'sim-unarchived'
+    directory.mkdir()
+    (directory / 'simulation_config.json').write_text('{}')
+    (directory / 'run_state.json').write_text('{}')
+    monkeypatch.setattr(SimulationRunner, 'RUN_STATE_DIR', str(tmp_path))
+    with pytest.raises(ValueError, match='must be archived'):
+        SimulationRunner.start_simulation('sim-unarchived')
+
+
+def test_stop_request_is_bounded_and_deduplicated_behind_real_drain_lock(monkeypatch, tmp_path):
+    simulation_id = 'sim-locked-stop'
+    state = SimulationRunState(simulation_id=simulation_id, runner_status=RunnerStatus.STOPPING)
+    monkeypatch.setattr(SimulationRunner, 'RUN_STATE_DIR', str(tmp_path))
+    monkeypatch.setattr(SimulationRunner, 'get_run_state', classmethod(lambda *_args: state))
+    monkeypatch.setattr(SimulationRunner, '_sync_simulation_status', classmethod(lambda *_args: None))
+    monkeypatch.setattr(runner_module.ZepGraphMemoryManager, 'get_updater', classmethod(lambda *_args: None))
+    lock = SimulationRunner._finalization_lock(simulation_id)
+    lock.acquire()
+    original_stop = SimulationRunner.stop_simulation
+    entered = threading.Event()
+    calls = []
+
+    def stop(_cls, identifier):
+        calls.append(identifier)
+        entered.set()
+        return original_stop(identifier)
+
+    monkeypatch.setattr(SimulationRunner, 'stop_simulation', classmethod(stop))
+    try:
+        start = time.monotonic()
+        with pytest.raises(SimulationStopPending):
+            SimulationRunner.request_stop(simulation_id, wait_timeout=0.02)
+        assert entered.wait(1)
+        with pytest.raises(SimulationStopPending):
+            SimulationRunner.request_stop(simulation_id, wait_timeout=0.02)
+        assert time.monotonic() - start < 1
+        assert calls == [simulation_id]
+        future = SimulationRunner._stop_requests[simulation_id]
+    finally:
+        lock.release()
+    try:
+        assert future.result(timeout=3).runner_status == RunnerStatus.STOPPED
+        assert SimulationRunner.request_stop(simulation_id).runner_status == RunnerStatus.STOPPED
+        assert calls == [simulation_id]
+    finally:
+        SimulationRunner._manual_stop_requests.discard(simulation_id)
 
 
 @pytest.mark.parametrize('locale, expected', [('en', 'Graph ingestion did not complete'), ('zh', '图谱写入未完整完成')])
@@ -261,7 +362,7 @@ def test_stop_api_keeps_pending_finalization_out_of_failed_state(monkeypatch):
     saved = []
     monkeypatch.setattr(
         simulation_api.SimulationRunner,
-        "stop_simulation",
+        "request_stop",
         classmethod(
             lambda _cls, _simulation_id, **_kwargs: (_ for _ in ()).throw(
                 SimulationStopPending("still draining")
@@ -340,7 +441,7 @@ def test_force_restart_does_not_continue_while_old_ingestion_is_pending(monkeypa
     )
     monkeypatch.setattr(
         simulation_api.SimulationRunner,
-        "stop_simulation",
+        "request_stop",
         classmethod(
             lambda _cls, _simulation_id: (_ for _ in ()).throw(
                 SimulationStopPending("still draining")
