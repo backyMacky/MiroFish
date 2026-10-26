@@ -603,8 +603,9 @@ class ParallelIPCHandler:
 
 def load_config(config_path: str) -> Dict[str, Any]:
     """加载配置文件"""
+    from app.utils.simulation_values import normalize_config_hours
     with open(config_path, 'r', encoding='utf-8') as f:
-        return json.load(f)
+        return normalize_config_hours(json.load(f))
 
 
 # 需要过滤掉的非核心动作类型（这些动作对分析价值较低）

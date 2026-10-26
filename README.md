@@ -203,6 +203,9 @@ HTTP disconnects; polling never resubmits inference. The command wait bound is
 `INTERVIEW_COMMAND_TIMEOUT_SECONDS` (default 3,600, range 1–7,200 seconds).
 Expiry leaves the command available for review; it does not claim cancellation.
 Missing actor/platform responses cannot acknowledge a successful interview.
+Scheduling readers normalize numeric hour strings and exact `HH:00` values to
+integer hours, preserving raw saved AI files. Ranges and partial hours fail
+validation; listed endpoints are never expanded into an inferred daily range.
 
 ## 📬 Join the Conversation
 

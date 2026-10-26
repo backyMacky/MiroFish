@@ -16,6 +16,7 @@ from enum import Enum
 from ..config import Config
 from ..utils.logger import get_logger
 from ..utils.fileio import atomic_write_json
+from ..utils.simulation_values import normalize_config_hours
 from .zep_entity_reader import ZepEntityReader, FilteredEntities
 from .oasis_profile_generator import OasisProfileGenerator, OasisAgentProfile
 from .simulation_config_generator import SimulationConfigGenerator, SimulationParameters
@@ -547,7 +548,7 @@ class SimulationManager:
             return None
         
         with open(config_path, 'r', encoding='utf-8') as f:
-            return json.load(f)
+            return normalize_config_hours(json.load(f))
     
     def get_run_instructions(self, simulation_id: str) -> Dict[str, str]:
         """获取运行说明"""

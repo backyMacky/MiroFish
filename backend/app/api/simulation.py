@@ -21,6 +21,7 @@ from ..services.simulation_runner import (
 )
 from ..services.zep_graph_memory_updater import ZepGraphMemoryManager
 from ..utils.logger import get_logger
+from ..utils.simulation_values import normalize_config_hours
 from ..utils.locale import t, get_locale, set_locale
 from ..utils.zep_lifecycle import get_graph_readers, graph_lifecycle_lock
 from ..models.project import ProjectManager
@@ -1280,6 +1281,12 @@ def get_simulation_config_realtime(simulation_id: str):
             except (json.JSONDecodeError, Exception) as e:
                 logger.warning(f"读取 config 文件失败（可能正在写入中）: {e}")
                 config = None
+
+        if config is not None:
+            try:
+                config = normalize_config_hours(config)
+            except ValueError as error:
+                return jsonify({'success': False, 'error': str(error)}), 422
         
         # 检查是否正在生成（通过 state.json 判断）
         is_generating = False
@@ -1381,6 +1388,8 @@ def get_simulation_config(simulation_id: str):
             "data": config
         })
         
+    except ValueError as error:
+        return jsonify({'success': False, 'error': str(error)}), 422
     except Exception as e:
         logger.error(f"获取配置失败: {str(e)}")
         return jsonify({

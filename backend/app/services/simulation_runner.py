@@ -23,6 +23,7 @@ from queue import Queue
 from ..config import Config
 from ..utils.logger import get_logger
 from ..utils.locale import get_locale, set_locale, t
+from ..utils.simulation_values import normalize_config_hours
 from ..utils.zep import (
     ZEP_HTTP_REQUEST_TIMEOUT_SECONDS,
     ZEP_INGESTION_WAIT_TIMEOUT_SECONDS,
@@ -399,7 +400,7 @@ class SimulationRunner:
             raise ValueError(f"模拟配置不存在，请先调用 /prepare 接口")
         
         with open(config_path, 'r', encoding='utf-8') as f:
-            config = json.load(f)
+            config = normalize_config_hours(json.load(f))
         
         # 初始化运行状态
         time_config = config.get("time_config", {})

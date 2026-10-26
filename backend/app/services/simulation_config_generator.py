@@ -24,6 +24,7 @@ from ..utils.logger import get_logger
 from ..utils.locale import get_language_instruction, t
 from ..utils.openai_chat_compat import create_chat_completion, extract_chat_completion_text
 from ..utils.llm_client import LLMClient
+from ..utils.simulation_values import normalize_hours
 from .zep_entity_reader import EntityNode, ZepEntityReader
 
 logger = get_logger('mirofish.simulation_config')
@@ -82,6 +83,9 @@ class AgentActivityConfig:
     # Influence weight (determines probability of their speech being seen by other agents)
     influence_weight: float = 1.0
 
+    def __post_init__(self):
+        self.active_hours = normalize_hours(self.active_hours)
+
 
 @dataclass
 class TimeSimulationConfig:
@@ -111,6 +115,10 @@ class TimeSimulationConfig:
     # Work hours
     work_hours: List[int] = field(default_factory=lambda: [9, 10, 11, 12, 13, 14, 15, 16, 17, 18])
     work_activity_multiplier: float = 0.7
+
+    def __post_init__(self):
+        for name in ('peak_hours', 'off_peak_hours', 'morning_hours', 'work_hours'):
+            setattr(self, name, normalize_hours(getattr(self, name)))
 
 
 @dataclass
@@ -811,6 +819,7 @@ Simulation Requirements: {simulation_requirement}
 ## Task
 Generate activity configuration for each entity, noting:
 - Return exactly {len(entity_list)} agent_configs objects, with numeric agent_id values {json.dumps([row['agent_id'] for row in entity_list])} exactly once each. Do not create additional agents or include explanations.
+- active_hours must enumerate individual integer hours from 0 to 23. For 9am through 5pm use [9,10,11,12,13,14,15,16,17], never clock strings or range endpoints.
 - **Time follows the target audience's daily rhythm**: The UTC+8 example below is a reference; adjust it to the simulation scenario
 - **Official institutions** (University/GovernmentAgency): Low activity (0.1-0.3), active during work hours (9-17), slow response (60-240 min), high influence (2.5-3.0)
 - **Media** (MediaOutlet): Medium activity (0.4-0.6), active all day (8-23), fast response (5-30 min), high influence (2.0-2.5)
@@ -825,7 +834,7 @@ Return JSON format (no markdown):
             "activity_level": <0.0-1.0>,
             "posts_per_hour": <posting frequency>,
             "comments_per_hour": <comment frequency>,
-            "active_hours": [<active hours list, consider the target audience's daily rhythm>],
+            "active_hours": [9, 10, 11, 12, 13, 14, 15, 16, 17],
             "response_delay_min": <minimum response delay minutes>,
             "response_delay_max": <maximum response delay minutes>,
             "sentiment_bias": <-1.0 to 1.0>,

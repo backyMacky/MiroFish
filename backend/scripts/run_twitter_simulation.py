@@ -413,8 +413,9 @@ class TwitterSimulationRunner:
         
     def _load_config(self) -> Dict[str, Any]:
         """加载配置文件"""
+        from app.utils.simulation_values import normalize_config_hours
         with open(self.config_path, 'r', encoding='utf-8') as f:
-            return json.load(f)
+            return normalize_config_hours(json.load(f))
     
     def _get_profile_path(self) -> str:
         """获取Profile文件路径（OASIS Twitter使用CSV格式）"""
