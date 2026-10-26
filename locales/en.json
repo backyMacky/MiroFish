@@ -150,8 +150,7 @@
     "roundsConfigDesc": "MiroFish auto-plans to simulate {hours} real-world hours, each round representing {minutesPerRound} minutes of elapsed time",
     "customToggle": "Custom",
     "roundsUnit": "rounds",
-    "estimatedDuration": "For 100 Agents: est. ~{minutes} minutes",
-    "estimatedDurationFull": "For 100 Agents: est. {minutes} minutes",
+    "estimatedDuration": "Runtime depends on agent activity, model speed and graph processing.",
     "recommendedRounds": "{rounds} (recommended)",
     "customTip": "For first-time runs, we strongly recommend switching to 'Custom Mode' to reduce rounds for a quick preview and lower error risk",
     "backToGraphBuild": "Back to Graph Build",
@@ -323,6 +322,7 @@
     "unknownFile": "Unknown file"
   },
   "api": {
+    "graphIngestionIncomplete": "Graph ingestion did not complete: {error}",
     "projectNotFound": "Project not found: {id}",
     "projectDeleteFailed": "Project not found or deletion failed: {id}",
     "projectDeleted": "Project deleted: {id}",

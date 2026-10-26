@@ -150,8 +150,7 @@
     "roundsConfigDesc": "MiroFish 自动规划推演现实 {hours} 小时，每轮代表现实 {minutesPerRound} 分钟时间流逝",
     "customToggle": "自定义",
     "roundsUnit": "轮",
-    "estimatedDuration": "若Agent规模为100：预计耗时约 {minutes} 分钟",
-    "estimatedDurationFull": "若Agent规模为100：预计耗时 {minutes} 分钟",
+    "estimatedDuration": "实际耗时取决于智能体活跃度、模型速度和图谱处理。",
     "recommendedRounds": "{rounds} (推荐)",
     "customTip": "若首次运行，强烈建议切换至'自定义模式'减少模拟轮数，以便快速预览效果并降低报错风险",
     "backToGraphBuild": "返回图谱构建",
@@ -323,6 +322,7 @@
     "unknownFile": "未知文件"
   },
   "api": {
+    "graphIngestionIncomplete": "图谱写入未完整完成: {error}",
     "projectNotFound": "项目不存在: {id}",
     "projectDeleteFailed": "项目不存在或删除失败: {id}",
     "projectDeleted": "项目已删除: {id}",

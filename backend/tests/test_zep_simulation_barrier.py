@@ -112,7 +112,8 @@ def test_explicit_restart_archives_previous_run_without_touching_preparation(mon
         SimulationRunner.cleanup_simulation_logs('../outside')
 
 
-def test_manual_stop_surfaces_graph_ingestion_failure(monkeypatch):
+@pytest.mark.parametrize('locale, expected', [('en', 'Graph ingestion did not complete'), ('zh', '图谱写入未完整完成')])
+def test_manual_stop_surfaces_graph_ingestion_failure(monkeypatch, locale, expected):
     state = SimulationRunState(
         simulation_id="sim-1",
         runner_status=RunnerStatus.RUNNING,
@@ -140,14 +141,19 @@ def test_manual_stop_surfaces_graph_ingestion_failure(monkeypatch):
     SimulationRunner._processes.pop("sim-1", None)
     SimulationRunner._graph_memory_enabled["sim-1"] = True
 
+    previous_locale = runner_module.get_locale()
+    runner_module.set_locale(locale)
     try:
         with pytest.raises(RuntimeError, match="ingestion incomplete"):
             SimulationRunner.stop_simulation("sim-1")
 
         assert state.runner_status == RunnerStatus.FAILED
         assert "ingestion incomplete" in state.error
+        assert expected in state.error
+        assert 'Zep' not in state.error
         assert saved[-1] == RunnerStatus.FAILED
     finally:
+        runner_module.set_locale(previous_locale)
         SimulationRunner._graph_memory_enabled.pop("sim-1", None)
         SimulationRunner._manual_stop_requests.discard("sim-1")
 
