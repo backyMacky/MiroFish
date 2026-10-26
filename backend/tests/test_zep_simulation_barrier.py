@@ -174,6 +174,48 @@ def test_runner_refuses_unarchived_events_before_launch(monkeypatch, tmp_path):
         SimulationRunner.start_simulation('sim-unarchived')
 
 
+def test_real_subprocess_output_does_not_collide_with_structured_log(monkeypatch, tmp_path):
+    import shutil
+    from pathlib import Path
+    simulation_id = 'sim-independent-output'
+    directory = tmp_path / simulation_id
+    directory.mkdir()
+    (directory / 'simulation_config.json').write_text('{"time_config":{"total_simulation_hours":1,"minutes_per_round":60}}')
+    scripts = tmp_path / 'scripts'
+    scripts.mkdir()
+    shutil.copyfile(Path(__file__).resolve().parents[1] / 'scripts' / 'action_logger.py', scripts / 'action_logger.py')
+    (scripts / 'run_twitter_simulation.py').write_text(
+        "import os\nfrom action_logger import SimulationLogManager\n"
+        "print('before structured logger')\n"
+        "log = SimulationLogManager(os.getcwd())\nlog.info('main marker')\n"
+        "print('IPC marker after structured logger')\n"
+        "assert os.environ['PYTHONUNBUFFERED'] == '1'\n",
+        encoding='utf-8',
+    )
+    monkeypatch.setattr(SimulationRunner, 'RUN_STATE_DIR', str(tmp_path))
+    monkeypatch.setattr(SimulationRunner, 'SCRIPTS_DIR', str(scripts))
+    monkeypatch.setattr(SimulationRunner, '_monitor_simulation', classmethod(lambda *_args: None))
+    monkeypatch.setattr(SimulationRunner, '_sync_simulation_status', classmethod(lambda *_args: None))
+    process = None
+    try:
+        SimulationRunner.start_simulation(simulation_id, platform='twitter')
+        process = SimulationRunner._processes[simulation_id]
+        assert process.wait(timeout=10) == 0
+        output = (directory / 'stdout.log').read_text(encoding='utf-8')
+        assert 'before structured logger' in output
+        assert 'IPC marker after structured logger' in output
+        assert 'main marker' in (directory / 'simulation.log').read_text(encoding='utf-8')
+    finally:
+        if process is not None:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=5)
+            SimulationRunner._release_process_resources(simulation_id, process)
+        SimulationRunner._run_states.pop(simulation_id, None)
+        SimulationRunner._monitor_threads.pop(simulation_id, None)
+        SimulationRunner._graph_memory_enabled.pop(simulation_id, None)
+
+
 def test_stop_request_is_bounded_and_deduplicated_behind_real_drain_lock(monkeypatch, tmp_path):
     simulation_id = 'sim-locked-stop'
     state = SimulationRunState(simulation_id=simulation_id, runner_status=RunnerStatus.STOPPING)
