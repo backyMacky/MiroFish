@@ -18,6 +18,8 @@
     "back": "Back",
     "next": "Next",
     "retry": "Retry",
+    "stop": "Stop",
+    "restartSimulation": "Restart simulation",
     "noData": "No data available",
     "hours": "hours",
     "minutes": "minutes",
@@ -294,6 +296,8 @@
     "relationship": "Relationship",
     "graphDataLoading": "Loading graph data...",
     "waitingOntology": "Waiting for ontology generation...",
+    "showEdgeLabels": "Show Edge Labels",
+    "inspectNode": "Inspect {name}",
     "toggleMaximize": "Maximize/Restore",
     "closeHint": "Close hint"
   },

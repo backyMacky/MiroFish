@@ -414,7 +414,9 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { generateOntologyChunked, getProject, buildGraph, getTaskStatus, getGraphData } from '../api/graph'
+import { generateOntologyChunked, regenerateOntology, waitForOntology, getProject, buildGraph, getTaskStatus, getGraphData } from '../api/graph'
+
+const ontologyController = new AbortController()
 import { createSimulation } from '../api/simulation'
 import { getPendingUpload, clearPendingUpload } from '../store/pendingUpload'
 import * as d3 from 'd3'
@@ -603,6 +605,13 @@ const handleNewProject = async () => {
     const response = await generateOntologyChunked({
       files: pending.files,
       simulationRequirement: pending.simulationRequirement,
+      signal: ontologyController.signal,
+      onTaskStarted: ({ project_id }) => {
+        currentProjectId.value = project_id
+        clearPendingUpload()
+        router.replace({ name: 'Process', params: { projectId: project_id } })
+      },
+      onProgress: (task) => { ontologyProgress.value = { message: task.message || 'Generating ontology...' } },
       onChunkStart: ({ chunkIndex, totalChunks, fileCount }) => {
         if (totalChunks <= 1) {
           ontologyProgress.value = { message: '正在上传文件并分析文档...' }
@@ -643,13 +652,53 @@ const handleNewProject = async () => {
   }
 }
 
+const retryProject = async () => {
+  try {
+    loading.value = true
+    error.value = null
+    const latest = await getProject(currentProjectId.value, { signal: ontologyController.signal })
+    projectData.value = latest.data
+    if (latest.data.status === 'failed' && !latest.data.ontology && !latest.data.graph_id) {
+      currentPhase.value = 0
+      ontologyProgress.value = { message: 'Generating ontology...' }
+      const result = await regenerateOntology(currentProjectId.value, {
+        signal: ontologyController.signal,
+        onProgress: (task) => { ontologyProgress.value = { message: task.message || 'Generating ontology...' } },
+      })
+      projectData.value = { ...result.data, status: 'ontology_generated' }
+      ontologyProgress.value = null
+      await startBuildGraph()
+    } else if (latest.data.status === 'failed' && latest.data.ontology) {
+      await startBuildGraph(true)
+    } else {
+      await loadProject()
+    }
+  } catch (err) {
+    error.value = err.message || 'Could not recover this project'
+  } finally {
+    loading.value = false
+  }
+}
+
 // 加载已有项目数据
 const loadProject = async () => {
   try {
     loading.value = true
-    const response = await getProject(currentProjectId.value)
+    let response = await getProject(currentProjectId.value, { signal: ontologyController.signal })
     
     if (response.success) {
+      projectData.value = response.data
+      if (response.data.status === 'failed') throw new Error(response.data.error || 'Project generation failed')
+      if (response.data.status === 'created' && response.data.ontology_task_id) {
+        currentPhase.value = 0
+        ontologyProgress.value = { message: 'Generating ontology...' }
+        const completed = await waitForOntology(response.data.ontology_task_id, {
+          signal: ontologyController.signal,
+          onProgress: (task) => { ontologyProgress.value = { message: task.message || 'Generating ontology...' } },
+        })
+        response = { success: true, data: { ...response.data, ...completed.data, status: 'ontology_generated' } }
+        ontologyProgress.value = null
+      }
       projectData.value = response.data
       updatePhaseByStatus(response.data.status)
       
@@ -699,7 +748,7 @@ const updatePhaseByStatus = (status) => {
 }
 
 // 开始构建图谱
-const startBuildGraph = async () => {
+const startBuildGraph = async (preserveFailedGraph = false) => {
   try {
     currentPhase.value = 1
     // 设置初始进度
@@ -708,7 +757,7 @@ const startBuildGraph = async () => {
       message: '正在启动图谱构建...'
     }
     
-    const response = await buildGraph({ project_id: currentProjectId.value })
+    const response = await buildGraph({ project_id: currentProjectId.value, preserve_failed_graph: preserveFailedGraph })
     
     if (response.success) {
       if (response.data.reused && response.data.graph_id) {
@@ -1118,6 +1167,7 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+  ontologyController.abort()
   stopPolling()
   stopGraphPolling()
 })

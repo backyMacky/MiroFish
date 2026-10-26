@@ -47,9 +47,9 @@ export const getSimulationProfiles = (simulationId, platform) => {
  * @param {string} simulationId
  * @param {string} [platform] - 'reddit' | 'twitter'（省略时由后端根据模拟配置自动选择）
  */
-export const getSimulationProfilesRealtime = (simulationId, platform) => {
+export const getSimulationProfilesRealtime = (simulationId, platform, signal) => {
   const params = platform ? { platform } : {}
-  return service.get(`/api/simulation/${simulationId}/profiles/realtime`, { params })
+  return service.get(`/api/simulation/${simulationId}/profiles/realtime`, { params, signal })
 }
 
 /**
@@ -65,8 +65,8 @@ export const getSimulationConfig = (simulationId) => {
  * @param {string} simulationId
  * @returns {Promise} 返回配置信息，包含元数据和配置内容
  */
-export const getSimulationConfigRealtime = (simulationId) => {
-  return service.get(`/api/simulation/${simulationId}/config/realtime`)
+export const getSimulationConfigRealtime = (simulationId, signal) => {
+  return service.get(`/api/simulation/${simulationId}/config/realtime`, { signal })
 }
 
 /**
@@ -98,16 +98,16 @@ export const stopSimulation = (data) => {
  * 获取模拟运行实时状态
  * @param {string} simulationId
  */
-export const getRunStatus = (simulationId) => {
-  return service.get(`/api/simulation/${simulationId}/run-status`)
+export const getRunStatus = (simulationId, signal) => {
+  return service.get(`/api/simulation/${simulationId}/run-status`, { signal })
 }
 
 /**
  * 获取模拟运行详细状态（包含最近动作）
  * @param {string} simulationId
  */
-export const getRunStatusDetail = (simulationId) => {
-  return service.get(`/api/simulation/${simulationId}/run-status/detail`)
+export const getRunStatusDetail = (simulationId, signal) => {
+  return service.get(`/api/simulation/${simulationId}/run-status/detail`, { signal })
 }
 
 /**

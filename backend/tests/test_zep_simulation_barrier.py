@@ -1,5 +1,8 @@
 from types import SimpleNamespace
 import json
+import subprocess
+import sys
+import time
 
 import pytest
 from flask import Flask
@@ -13,6 +16,74 @@ from app.services.simulation_runner import (
     SimulationRunner,
     SimulationStopPending,
 )
+
+
+def test_finished_loops_drain_while_real_interview_process_stays_alive(monkeypatch, tmp_path):
+    """The process deliberately waits for IPC after its producer-end receipt."""
+    simulation_id = 'sim-live-environment'
+    directory = tmp_path / simulation_id / 'twitter'
+    directory.mkdir(parents=True)
+    (directory / 'actions.jsonl').write_text(
+        '{"event_type":"simulation_end","total_rounds":2,"total_actions":0}\n', encoding='utf-8',
+    )
+    monkeypatch.setattr(SimulationRunner, 'RUN_STATE_DIR', str(tmp_path))
+    monkeypatch.setattr(SimulationRunner, '_sync_simulation_status', classmethod(lambda *_a, **_k: None))
+    state = SimulationRunState(simulation_id=simulation_id, runner_status=RunnerStatus.RUNNING, twitter_running=True)
+    process = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+    SimulationRunner._processes[simulation_id] = process
+    SimulationRunner._run_states[simulation_id] = state
+    SimulationRunner._graph_memory_enabled[simulation_id] = True
+    drained = []
+    def drain(_cls, identifier):
+        assert identifier == simulation_id
+        assert process.poll() is None
+        assert state.runner_status == RunnerStatus.STOPPING
+        drained.append(True)
+    monkeypatch.setattr(runner_module.ZepGraphMemoryManager, 'stop_updater', classmethod(drain))
+    try:
+        SimulationRunner._monitor_simulation(simulation_id)
+        assert drained == [True]
+        assert process.poll() is None
+        assert state.runner_status == RunnerStatus.COMPLETED
+        assert SimulationRunner._processes[simulation_id] is process
+        saved = json.loads((tmp_path / simulation_id / 'run_state.json').read_text())
+        assert saved['runner_status'] == 'completed'
+    finally:
+        process.terminate()
+        process.wait(timeout=10)
+        for _ in range(100):
+            if simulation_id not in SimulationRunner._processes:
+                break
+            time.sleep(0.01)
+        SimulationRunner._processes.pop(simulation_id, None)
+        SimulationRunner._run_states.pop(simulation_id, None)
+        SimulationRunner._graph_memory_enabled.pop(simulation_id, None)
+
+
+def test_missing_second_platform_log_is_not_completion(monkeypatch, tmp_path):
+    monkeypatch.setattr(SimulationRunner, 'RUN_STATE_DIR', str(tmp_path))
+    directory = tmp_path / 'sim-dual' / 'twitter'
+    directory.mkdir(parents=True)
+    (directory / 'actions.jsonl').write_text('', encoding='utf-8')
+    state = SimulationRunState(simulation_id='sim-dual', twitter_completed=True, reddit_running=True)
+    assert not SimulationRunner._check_all_platforms_completed(state)
+
+
+def test_explicit_restart_archives_previous_run_without_touching_preparation(monkeypatch, tmp_path):
+    monkeypatch.setattr(SimulationRunner, 'RUN_STATE_DIR', str(tmp_path))
+    directory = tmp_path / 'sim-archive'
+    (directory / 'twitter').mkdir(parents=True)
+    (directory / 'run_state.json').write_text('{"runner_status":"completed"}')
+    (directory / 'twitter' / 'actions.jsonl').write_text('synthetic action\n')
+    (directory / 'simulation_config.json').write_text('synthetic configuration')
+    result = SimulationRunner.cleanup_simulation_logs('sim-archive')
+    assert result['success']
+    archive = __import__('pathlib').Path(result['archive_directory'])
+    assert (archive / 'twitter' / 'actions.jsonl').read_text() == 'synthetic action\n'
+    assert (directory / 'simulation_config.json').read_text() == 'synthetic configuration'
+    assert not (directory / 'run_state.json').exists()
+    with pytest.raises(ValueError, match='Invalid simulation directory'):
+        SimulationRunner.cleanup_simulation_logs('../outside')
 
 
 def test_manual_stop_surfaces_graph_ingestion_failure(monkeypatch):
@@ -160,7 +231,7 @@ def test_stop_api_keeps_pending_finalization_out_of_failed_state(monkeypatch):
         simulation_api.SimulationRunner,
         "stop_simulation",
         classmethod(
-            lambda _cls, _simulation_id: (_ for _ in ()).throw(
+            lambda _cls, _simulation_id, **_kwargs: (_ for _ in ()).throw(
                 SimulationStopPending("still draining")
             )
         ),

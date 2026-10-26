@@ -74,3 +74,4 @@ def test_normalized_profile_serializes_to_twitter_and_reddit(tmp_path):
     assert reddit["persona"] == "详细, 人设"
     assert reddit["mbti"] == "ENFP"
     assert reddit["interested_topics"] == ["AI", "政策"]
+    assert reddit["country"] == "Unknown"

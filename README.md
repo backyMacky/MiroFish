@@ -176,6 +176,26 @@ Reads `.env` from root directory by default, maps ports `3000 (frontend) / 5001 
 
 > Mirror address for faster pulling is provided as comments in `docker-compose.yml`, replace if needed.
 
+### Local graph mode in this fork
+
+`GRAPH_BACKEND=local` selects the authenticated Graphiti worker used by the
+parent application's MiroFish deployment. Set `LOCAL_GRAPH_URL` to its internal
+HTTP address and mount `LOCAL_GRAPH_API_KEY_FILE` privately. The worker requires
+Neo4j, local embedding/reranking models and a configured inference provider.
+It runs in a separate Python environment from OASIS/CAMEL.
+
+The adapter implements the graph, episode, batch and search operations used by
+MiroFish. Its SQLite catalog persists under `backend/uploads/local-graph`;
+preserve that directory together with the worker's Neo4j data. Interrupted
+ingestion is recorded as failed rather than silently replayed. Local mode never
+falls back to Zep Cloud; the default `zep_cloud` mode still requires a Cloud key.
+
+For a single CPU inference server, set `LLM_MAX_CONCURRENT_REQUESTS=1` and choose
+`LLM_TIMEOUT_SECONDS` and `LOCAL_GRAPH_INGESTION_WAIT_TIMEOUT_SECONDS` for its
+measured throughput. Preparation and ontology work expose background task IDs.
+Reload reconnects to existing work; an explicit simulation restart archives the
+previous run. Model errors remain visible instead of producing fallback success.
+
 ## 📬 Join the Conversation
 
 <div align="center">

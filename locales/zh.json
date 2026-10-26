@@ -18,6 +18,8 @@
     "back": "返回",
     "next": "下一步",
     "retry": "重试",
+    "stop": "停止",
+    "restartSimulation": "重新运行模拟",
     "noData": "暂无数据",
     "hours": "小时",
     "minutes": "分钟",
@@ -294,6 +296,8 @@
     "relationship": "Relationship",
     "graphDataLoading": "图谱数据加载中...",
     "waitingOntology": "等待本体生成...",
+    "showEdgeLabels": "显示关系标签",
+    "inspectNode": "查看 {name}",
     "toggleMaximize": "最大化/还原",
     "closeHint": "关闭提示"
   },

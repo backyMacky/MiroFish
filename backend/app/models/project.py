@@ -7,6 +7,7 @@ import os
 import json
 import uuid
 import shutil
+import tempfile
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 from enum import Enum
@@ -38,6 +39,7 @@ class Project:
     
     # 本体信息（接口1生成后填充）
     ontology: Optional[Dict[str, Any]] = None
+    ontology_task_id: Optional[str] = None
     analysis_summary: Optional[str] = None
     
     # 图谱信息（接口2完成后填充）
@@ -45,6 +47,7 @@ class Project:
     graph_build_task_id: Optional[str] = None
     zep_batch_id: Optional[str] = None
     zep_batch_operation_id: Optional[str] = None
+    previous_graph_attempts: List[Dict[str, Any]] = field(default_factory=list)
     
     # 配置
     simulation_requirement: Optional[str] = None
@@ -66,10 +69,12 @@ class Project:
             "total_text_length": self.total_text_length,
             "ontology": self.ontology,
             "analysis_summary": self.analysis_summary,
+            "ontology_task_id": self.ontology_task_id,
             "graph_id": self.graph_id,
             "graph_build_task_id": self.graph_build_task_id,
             "zep_batch_id": self.zep_batch_id,
             "zep_batch_operation_id": self.zep_batch_operation_id,
+            "previous_graph_attempts": self.previous_graph_attempts,
             "simulation_requirement": self.simulation_requirement,
             "chunk_size": self.chunk_size,
             "chunk_overlap": self.chunk_overlap,
@@ -93,10 +98,12 @@ class Project:
             total_text_length=data.get('total_text_length', 0),
             ontology=data.get('ontology'),
             analysis_summary=data.get('analysis_summary'),
+            ontology_task_id=data.get('ontology_task_id'),
             graph_id=data.get('graph_id'),
             graph_build_task_id=data.get('graph_build_task_id'),
             zep_batch_id=data.get('zep_batch_id'),
             zep_batch_operation_id=data.get('zep_batch_operation_id'),
+            previous_graph_attempts=data.get('previous_graph_attempts', []),
             simulation_requirement=data.get('simulation_requirement'),
             chunk_size=data.get('chunk_size', 500),
             chunk_overlap=data.get('chunk_overlap', 50),
@@ -156,7 +163,9 @@ class ProjectManager:
             name=name,
             status=ProjectStatus.CREATED,
             created_at=now,
-            updated_at=now
+            updated_at=now,
+            chunk_size=Config.DEFAULT_CHUNK_SIZE,
+            chunk_overlap=Config.DEFAULT_CHUNK_OVERLAP,
         )
         
         # 创建项目目录结构
@@ -176,8 +185,20 @@ class ProjectManager:
         project.updated_at = datetime.now().isoformat()
         meta_path = cls._get_project_meta_path(project.project_id)
         
-        with open(meta_path, 'w', encoding='utf-8') as f:
-            json.dump(project.to_dict(), f, ensure_ascii=False, indent=2)
+        # Status readers can poll while background work saves. Publish one
+        # complete JSON document and preserve the previous file on failure.
+        descriptor, pending = tempfile.mkstemp(
+            prefix='.project-', suffix='.json', dir=os.path.dirname(meta_path)
+        )
+        try:
+            with os.fdopen(descriptor, 'w', encoding='utf-8') as output:
+                json.dump(project.to_dict(), output, ensure_ascii=False, indent=2)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(pending, meta_path)
+        finally:
+            if os.path.exists(pending):
+                os.unlink(pending)
     
     @classmethod
     def get_project(cls, project_id: str) -> Optional[Project]:

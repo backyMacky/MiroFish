@@ -38,7 +38,7 @@
     <!-- Main Content Area -->
     <main class="content-area">
       <!-- Left Panel: Graph -->
-      <div class="panel-wrapper left" :style="leftPanelStyle">
+      <div class="panel-wrapper left" :style="leftPanelStyle" :inert="viewMode === 'workbench'" :aria-hidden="viewMode === 'workbench'">
         <GraphPanel 
           :graphData="graphData"
           :loading="graphLoading"
@@ -50,7 +50,7 @@
       </div>
 
       <!-- Right Panel: Step3 开始模拟 -->
-      <div class="panel-wrapper right" :style="rightPanelStyle">
+      <div class="panel-wrapper right" :style="rightPanelStyle" :inert="viewMode === 'graph'" :aria-hidden="viewMode === 'graph'">
         <Step3Simulation
           :simulationId="currentSimulationId"
           :maxRounds="maxRounds"
@@ -77,6 +77,7 @@ import { getProject, getGraphData } from '../api/graph'
 import { getSimulation, getSimulationConfig, stopSimulation, closeSimulationEnv, getEnvStatus } from '../api/simulation'
 import LanguageSwitcher from '../components/LanguageSwitcher.vue'
 import { useI18n } from 'vue-i18n'
+import { startSerialPolling } from '../api/taskPolling'
 
 const { t } = useI18n()
 const route = useRoute()
@@ -245,7 +246,7 @@ const loadSimulationData = async () => {
   }
 }
 
-const loadGraph = async (graphId) => {
+const loadGraph = async (graphId, signal) => {
   // 当正在模拟时，自动刷新不显示全屏 loading，以免闪烁
   // 手动刷新或初始加载时显示 loading
   if (!isSimulating.value) {
@@ -253,7 +254,8 @@ const loadGraph = async (graphId) => {
   }
   
   try {
-    const res = await getGraphData(graphId)
+    const res = await getGraphData(graphId, signal)
+    if (signal?.aborted) return
     if (res.success) {
       graphData.value = res.data
       if (!isSimulating.value) {
@@ -261,15 +263,18 @@ const loadGraph = async (graphId) => {
       }
     }
   } catch (err) {
+    if (signal?.aborted) return
     addLog(t('log.graphLoadFailed', { error: err.message }))
   } finally {
     graphLoading.value = false
   }
 }
 
-const refreshGraph = () => {
+const refreshGraph = (signal) => {
   if (projectData.value?.graph_id) {
-    loadGraph(projectData.value.graph_id)
+    return loadGraph(projectData.value.graph_id, signal)
+  } else {
+    return loadSimulationData()
   }
 }
 
@@ -280,12 +285,12 @@ const startGraphRefresh = () => {
   if (graphRefreshTimer) return
   addLog(t('log.graphRealtimeRefreshStart'))
   // 立即刷新一次，然后每30秒刷新
-  graphRefreshTimer = setInterval(refreshGraph, 30000)
+  graphRefreshTimer = startSerialPolling(refreshGraph, { intervalMs: 30000 })
 }
 
 const stopGraphRefresh = () => {
   if (graphRefreshTimer) {
-    clearInterval(graphRefreshTimer)
+    graphRefreshTimer()
     graphRefreshTimer = null
     addLog(t('log.graphRealtimeRefreshStop'))
   }

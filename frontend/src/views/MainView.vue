@@ -35,13 +35,21 @@
       </div>
     </header>
 
+    <div v-if="error" class="generation-error" role="alert">
+      <span>{{ error }}</span>
+      <button v-if="currentProjectId && currentProjectId !== 'new'" :disabled="loading" @click="retryProject">
+        {{ $t('common.retry') }}
+      </button>
+    </div>
+
     <!-- Main Content Area -->
     <main class="content-area">
       <!-- Left Panel: Graph -->
-      <div class="panel-wrapper left" :style="leftPanelStyle">
+      <div class="panel-wrapper left" :style="leftPanelStyle" :inert="viewMode === 'workbench'" :aria-hidden="viewMode === 'workbench'">
         <GraphPanel 
           :graphData="graphData"
           :loading="graphLoading"
+          :canRefresh="Boolean(projectData?.graph_id)"
           :currentPhase="currentPhase"
           @refresh="refreshGraph"
           @toggle-maximize="toggleMaximize('graph')"
@@ -49,7 +57,7 @@
       </div>
 
       <!-- Right Panel: Step Components -->
-      <div class="panel-wrapper right" :style="rightPanelStyle">
+      <div class="panel-wrapper right" :style="rightPanelStyle" :inert="viewMode === 'graph'" :aria-hidden="viewMode === 'graph'">
         <!-- Step 1: 图谱构建 -->
         <Step1GraphBuild 
           v-if="currentStep === 1"
@@ -83,7 +91,10 @@ import { useI18n } from 'vue-i18n'
 import GraphPanel from '../components/GraphPanel.vue'
 import Step1GraphBuild from '../components/Step1GraphBuild.vue'
 import Step2EnvSetup from '../components/Step2EnvSetup.vue'
-import { generateOntologyChunked, getProject, buildGraph, getTaskStatus, getGraphData } from '../api/graph'
+import { generateOntologyChunked, regenerateOntology, waitForOntology, getProject, buildGraph, getTaskStatus, getGraphData } from '../api/graph'
+
+const ontologyController = new AbortController()
+import { waitForTask } from '../api/taskPolling'
 import { getPendingUpload, clearPendingUpload, restorePendingUpload } from '../store/pendingUpload'
 import LanguageSwitcher from '../components/LanguageSwitcher.vue'
 
@@ -111,8 +122,10 @@ const buildProgress = ref(null)
 const systemLogs = ref([])
 
 // Polling timers
-let pollTimer = null
+let taskController = null
 let graphPollTimer = null
+let graphPolling = false
+let graphPollingEpoch = 0
 
 // --- Computed Layout Styles ---
 const leftPanelStyle = computed(() => {
@@ -214,6 +227,13 @@ const handleNewProject = async () => {
     const res = await generateOntologyChunked({
       files: pending.files,
       simulationRequirement: pending.simulationRequirement,
+      signal: ontologyController.signal,
+      onTaskStarted: ({ project_id }) => {
+        currentProjectId.value = project_id
+        clearPendingUpload()
+        router.replace({ name: 'Process', params: { projectId: project_id } })
+      },
+      onProgress: (task) => { ontologyProgress.value = { message: task.message || 'Generating ontology...' } },
       onChunkStart: ({ chunkIndex, totalChunks, fileCount }) => {
         if (totalChunks <= 1) {
           addLog('Uploading ontology documents...')
@@ -243,12 +263,53 @@ const handleNewProject = async () => {
   }
 }
 
+const retryProject = async () => {
+  try {
+    loading.value = true
+    error.value = null
+    const latest = await getProject(currentProjectId.value, { signal: ontologyController.signal })
+    projectData.value = latest.data
+    if (latest.data.status === 'failed' && !latest.data.ontology && !latest.data.graph_id) {
+      currentPhase.value = 0
+      ontologyProgress.value = { message: 'Generating ontology...' }
+      const result = await regenerateOntology(currentProjectId.value, {
+        signal: ontologyController.signal,
+        onProgress: (task) => { ontologyProgress.value = { message: task.message || 'Generating ontology...' } },
+      })
+      projectData.value = { ...result.data, status: 'ontology_generated' }
+      ontologyProgress.value = null
+      await startBuildGraph()
+    } else if (latest.data.status === 'failed' && latest.data.ontology) {
+      await startBuildGraph(true)
+    } else {
+      await loadProject()
+    }
+  } catch (err) {
+    error.value = err.message || 'Could not recover this project'
+  } finally {
+    loading.value = false
+  }
+}
+
 const loadProject = async () => {
   try {
     loading.value = true
+    error.value = null
     addLog(`Loading project ${currentProjectId.value}...`)
-    const res = await getProject(currentProjectId.value)
+    let res = await getProject(currentProjectId.value, { signal: ontologyController.signal })
     if (res.success) {
+      projectData.value = res.data
+      if (res.data.status === 'failed') throw new Error(res.data.error || 'Project generation failed')
+      if (res.data.status === 'created' && res.data.ontology_task_id) {
+        currentPhase.value = 0
+        ontologyProgress.value = { message: 'Generating ontology...' }
+        const completed = await waitForOntology(res.data.ontology_task_id, {
+          signal: ontologyController.signal,
+          onProgress: (task) => { ontologyProgress.value = { message: task.message || 'Generating ontology...' } },
+        })
+        res = { success: true, data: { ...res.data, ...completed.data, status: 'ontology_generated' } }
+        ontologyProgress.value = null
+      }
       projectData.value = res.data
       updatePhaseByStatus(res.data.status)
       addLog(`Project loaded. Status: ${res.data.status}`)
@@ -284,13 +345,17 @@ const updatePhaseByStatus = (status) => {
   }
 }
 
-const startBuildGraph = async () => {
+const startBuildGraph = async (preserveFailedGraph = false) => {
   try {
     currentPhase.value = 1
+    if (preserveFailedGraph) {
+      graphData.value = null
+      projectData.value = { ...projectData.value, graph_id: null, status: 'graph_building' }
+    }
     buildProgress.value = { progress: 0, message: 'Starting build...' }
     addLog('Initiating graph build...')
     
-    const res = await buildGraph({ project_id: currentProjectId.value })
+    const res = await buildGraph({ project_id: currentProjectId.value, preserve_failed_graph: preserveFailedGraph })
     if (res.success) {
       if (res.data.reused && res.data.graph_id) {
         currentPhase.value = 2
@@ -316,67 +381,56 @@ const startBuildGraph = async () => {
 }
 
 const startGraphPolling = () => {
-  addLog('Started polling for graph data...')
-  fetchGraphData()
-  graphPollTimer = setInterval(fetchGraphData, 10000)
-}
-
-const fetchGraphData = async () => {
-  try {
-    // Refresh project info to check for graph_id
-    const projRes = await getProject(currentProjectId.value)
-    if (projRes.success && projRes.data.graph_id) {
-      const gRes = await getGraphData(projRes.data.graph_id)
-      if (gRes.success) {
-        graphData.value = gRes.data
-        const nodeCount = gRes.data.node_count || gRes.data.nodes?.length || 0
-        const edgeCount = gRes.data.edge_count || gRes.data.edges?.length || 0
-        addLog(`Graph data refreshed. Nodes: ${nodeCount}, Edges: ${edgeCount}`)
+  stopGraphPolling()
+  graphPolling = true
+  const epoch = graphPollingEpoch
+  const active = () => graphPolling && epoch === graphPollingEpoch
+  const refresh = async () => {
+    try {
+      const project = await getProject(currentProjectId.value, { signal: ontologyController.signal })
+      if (!active()) return
+      projectData.value = project.data
+      if (project.data.graph_id) {
+        const graph = await getGraphData(project.data.graph_id, ontologyController.signal)
+        if (active() && graph.success) graphData.value = graph.data
       }
+    } catch (err) {
+      if (!ontologyController.signal.aborted) addLog(`Graph refresh unavailable: ${err.message}`)
+    } finally {
+      if (active()) graphPollTimer = setTimeout(refresh, 10000)
     }
-  } catch (err) {
-    console.warn('Graph fetch error:', err)
   }
+  void refresh()
 }
 
-const startPollingTask = (taskId) => {
-  pollTaskStatus(taskId)
-  pollTimer = setInterval(() => pollTaskStatus(taskId), 2000)
-}
-
-const pollTaskStatus = async (taskId) => {
+const startPollingTask = async (taskId) => {
+  stopPolling()
+  const controller = new AbortController()
+  taskController = controller
+  startGraphPolling()
   try {
-    const res = await getTaskStatus(taskId)
-    if (res.success) {
-      const task = res.data
-      
-      // Log progress message if it changed
-      if (task.message && task.message !== buildProgress.value?.message) {
-        addLog(task.message)
-      }
-      
-      buildProgress.value = { progress: task.progress || 0, message: task.message }
-      
-      if (task.status === 'completed') {
-        addLog('Graph build task completed.')
-        stopPolling()
-        stopGraphPolling() // Stop polling, do final load
-        currentPhase.value = 2
-        
-        // Final load
-        const projRes = await getProject(currentProjectId.value)
-        if (projRes.success && projRes.data.graph_id) {
-            projectData.value = projRes.data
-            await loadGraph(projRes.data.graph_id)
-        }
-      } else if (task.status === 'failed') {
-        stopPolling()
-        error.value = task.error
-        addLog(`Graph build task failed: ${task.error}`)
-      }
+    await waitForTask((signal) => getTaskStatus(taskId, signal), {
+      signal: controller.signal,
+      onProgress: (task) => {
+        if (task.message && task.message !== buildProgress.value?.message) addLog(task.message)
+        buildProgress.value = { progress: task.progress || 0, message: task.message }
+      },
+    })
+    stopGraphPolling()
+    const project = await getProject(currentProjectId.value, { signal: controller.signal })
+    projectData.value = project.data
+    if (!project.data.graph_id) throw new Error('Graph build completed without a graph')
+    await loadGraph(project.data.graph_id)
+    currentPhase.value = 2
+    addLog('Graph build task completed.')
+  } catch (err) {
+    if (!controller.signal.aborted) {
+      stopGraphPolling()
+      error.value = err.message
+      addLog(`Graph build task failed: ${err.message}`)
     }
-  } catch (e) {
-    console.error(e)
+  } finally {
+    if (taskController === controller) taskController = null
   }
 }
 
@@ -389,35 +443,38 @@ const loadGraph = async (graphId) => {
       graphData.value = res.data
       addLog('Graph data loaded successfully.')
     } else {
-      addLog(`Failed to load graph data: ${res.error}`)
+      throw new Error(res.error || 'Graph data is unavailable')
     }
   } catch (e) {
     addLog(`Exception loading graph: ${e.message}`)
+    throw e
   } finally {
     graphLoading.value = false
   }
 }
 
-const refreshGraph = () => {
+const refreshGraph = async () => {
   if (projectData.value?.graph_id) {
-    addLog('Manual graph refresh triggered.')
-    loadGraph(projectData.value.graph_id)
+    try {
+      error.value = ''
+      addLog('Manual graph refresh triggered.')
+      await loadGraph(projectData.value.graph_id)
+    } catch (err) {
+      error.value = err.message
+    }
   }
 }
 
 const stopPolling = () => {
-  if (pollTimer) {
-    clearInterval(pollTimer)
-    pollTimer = null
-  }
+  taskController?.abort()
+  taskController = null
 }
 
 const stopGraphPolling = () => {
-  if (graphPollTimer) {
-    clearInterval(graphPollTimer)
-    graphPollTimer = null
-    addLog('Graph polling stopped.')
-  }
+  graphPolling = false
+  graphPollingEpoch++
+  if (graphPollTimer) clearTimeout(graphPollTimer)
+  graphPollTimer = null
 }
 
 onMounted(() => {
@@ -425,12 +482,30 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+  ontologyController.abort()
   stopPolling()
   stopGraphPolling()
 })
 </script>
 
 <style scoped>
+.generation-error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.75rem 1.5rem;
+  color: #9a3412;
+  background: #fff7ed;
+  border-bottom: 1px solid #fdba74;
+}
+.generation-error button {
+  padding: 0.4rem 0.8rem;
+  border: 1px solid currentColor;
+  border-radius: 4px;
+  background: white;
+  cursor: pointer;
+}
 .main-view {
   height: 100vh;
   display: flex;

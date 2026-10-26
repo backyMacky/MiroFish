@@ -110,17 +110,20 @@ Please output JSON format with the following structure:
 
 ### 1. Entity Type Design - Must Strictly Follow
 
-**Quantity requirement: Must have exactly 10 entity types**
+**Quantity: 2-10 entity types, proportional to the document. Use only types
+supported by the source and simulation requirement. Do not invent actors or
+duplicate role types to fill a quota. Small documents may need only the two
+fallback types. Keep descriptions and explanations concise.**
 
 **Hierarchical structure requirement (must include both specific types and fallback types)**:
 
-Your 10 entity types must include the following hierarchy:
+Your entity types must include the following hierarchy:
 
 A. **Fallback types (must include, place in last 2 of list)**:
    - `Person`: Fallback type for any natural person. When a person does not fit other more specific person types, use this.
    - `Organization`: Fallback type for any organization. When an organization does not fit other more specific organization types, use this.
 
-B. **Specific types (8, designed based on text content)**:
+B. **Specific types (0-8, only when justified by text content)**:
    - Design more specific types for main characters appearing in the text
    - Example: If text involves academic events, can have `Student`, `Professor`, `University`
    - Example: If text involves business events, can have `Company`, `CEO`, `Employee`
@@ -137,7 +140,7 @@ B. **Specific types (8, designed based on text content)**:
 
 ### 2. Relationship Type Design
 
-- Quantity: 6-10
+- Quantity: 1-10, only relationships supported by the source and scenario
 - Relationships should reflect real connections in social media interactions
 - Ensure relationship source_targets cover your defined entity types
 
@@ -283,9 +286,9 @@ class OntologyGenerator:
 Based on the above content, design entity types and relationship types suitable for social opinion simulation.
 
 **Rules to follow**:
-1. Must output exactly 10 entity types
+1. Output 2-10 entity types, proportional to the source; do not fill a quota
 2. Last 2 must be fallback types: Person (individual fallback) and Organization (organization fallback)
-3. First 8 are specific types designed based on text content
+3. Include 0-8 specific types only when justified by the source; avoid duplicate role categories
 4. All entity types must be real-world subjects that can voice opinions, not abstract concepts
 5. Attribute names cannot use reserved words like name, uuid, group_id, or graph_id; use full_name, org_name, etc. instead
 """

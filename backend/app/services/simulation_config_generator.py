@@ -22,6 +22,7 @@ from ..config import Config
 from ..utils.logger import get_logger
 from ..utils.locale import get_language_instruction, t
 from ..utils.openai_chat_compat import create_chat_completion, extract_chat_completion_text
+from ..utils.llm_client import LLMClient
 from .zep_entity_reader import EntityNode, ZepEntityReader
 
 logger = get_logger('mirofish.simulation_config')
@@ -236,10 +237,9 @@ class SimulationConfigGenerator:
         if not self.api_key:
             raise ValueError("LLM_API_KEY not configured")
 
-        self.client = OpenAI(
-            api_key=self.api_key,
-            base_url=self.base_url
-        )
+        self.client = LLMClient(
+            api_key=self.api_key, base_url=self.base_url, model=self.model_name,
+        ).client
     
     def generate_config(
         self,
@@ -433,55 +433,20 @@ class SimulationConfigGenerator:
         return "\n".join(lines)
     
     def _call_llm_with_retry(self, prompt: str, system_prompt: str) -> Dict[str, Any]:
-        """LLM call with retry, including JSON repair logic"""
-        import re
+        """Request one complete configuration; surface provider failures for retry."""
+        try:
+            response = create_chat_completion(
+                self.client, model=self.model_name,
+                messages=[{"role": "system", "content": system_prompt},
+                          {"role": "user", "content": prompt}],
+                response_format={"type": "json_object"}, temperature=0.5,
+                max_tokens=4096,
+            )
+            return LLMClient._parse_json_response(response)
+        except Exception as error:
+            logger.warning("Simulation configuration request failed (%s)", type(error).__name__)
+            raise RuntimeError("AI simulation configuration failed; retry preparation after checking the model") from None
 
-        max_attempts = 3
-        last_error = None
-
-        for attempt in range(max_attempts):
-            try:
-                response = create_chat_completion(
-                    self.client,
-                    model=self.model_name,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": prompt}
-                    ],
-                    response_format={"type": "json_object"},
-                    temperature=0.7 - (attempt * 0.1),  # Lower temperature on each retry
-                    # Do not set max_tokens; allow the provider-specific limit.
-                )
-
-                content = extract_chat_completion_text(response)
-                finish_reason = response.choices[0].finish_reason
-
-                # Check if output was truncated
-                if finish_reason == 'length':
-                    logger.warning(f"LLM output truncated (attempt {attempt+1})")
-                    content = self._fix_truncated_json(content)
-
-                # Try to parse JSON
-                try:
-                    return json.loads(content)
-                except json.JSONDecodeError as e:
-                    logger.warning(f"JSON parsing failed (attempt {attempt+1}): {str(e)[:80]}")
-
-                    # Try to fix JSON
-                    fixed = self._try_fix_config_json(content)
-                    if fixed:
-                        return fixed
-
-                    last_error = e
-
-            except Exception as e:
-                logger.warning(f"LLM call failed (attempt {attempt+1}): {str(e)[:80]}")
-                last_error = e
-                import time
-                time.sleep(2 * (attempt + 1))
-
-        raise last_error or Exception("LLM call failed")
-    
     def _fix_truncated_json(self, content: str) -> str:
         """Fix truncated JSON"""
         content = content.strip()
@@ -589,12 +554,8 @@ Field description:
 
         system_prompt = "You are a social media simulation expert. Return pure JSON format. The time configuration must follow the target audience's daily rhythm for the simulation scenario."
         system_prompt = f"{system_prompt}\n\n{get_language_instruction()}"
-        try:
-            return self._call_llm_with_retry(prompt, system_prompt)
-        except Exception as e:
-            logger.warning(f"Time config LLM generation failed: {e}, using default configuration")
-            return self._get_default_time_config(num_entities)
-    
+        return self._call_llm_with_retry(prompt, system_prompt)
+
     def _get_default_time_config(self, num_entities: int) -> Dict[str, Any]:
         """Get default time configuration (Chinese work schedule)"""
         return {
@@ -715,16 +676,7 @@ Return JSON format (no markdown):
         system_prompt = "You are an opinion analysis expert. Return pure JSON format. The poster_type value must exactly match one of the available entity types."
         system_prompt = f"{system_prompt}\n\n{get_language_instruction()}\nIMPORTANT: The 'poster_type' field value MUST be in English PascalCase exactly matching the available entity types. Only 'content', 'narrative_direction', 'hot_topics' and 'reasoning' fields should use the specified language."
 
-        try:
-            return self._call_llm_with_retry(prompt, system_prompt)
-        except Exception as e:
-            logger.warning(f"Event config LLM generation failed: {e}, using default configuration")
-            return {
-                "hot_topics": [],
-                "narrative_direction": "",
-                "initial_posts": [],
-                "reasoning": "Using default configuration"
-            }
+        return self._call_llm_with_retry(prompt, system_prompt)
 
     def _parse_event_config(self, result: Dict[str, Any]) -> EventConfig:
         """Parse event configuration result"""
@@ -879,22 +831,20 @@ Return JSON format (no markdown):
         system_prompt = "You are a social media behavior analysis expert. Return pure JSON. The configuration must follow the target audience's daily rhythm for the simulation scenario."
         system_prompt = f"{system_prompt}\n\n{get_language_instruction()}\nIMPORTANT: The 'stance' field value MUST be one of the English strings: 'supportive', 'opposing', 'neutral', 'observer'. All JSON field names and numeric values must remain unchanged. Only natural language text fields should use the specified language."
 
-        try:
-            result = self._call_llm_with_retry(prompt, system_prompt)
-            llm_configs = {cfg["agent_id"]: cfg for cfg in result.get("agent_configs", [])}
-        except Exception as e:
-            logger.warning(f"Agent config batch LLM generation failed: {e}, using rule-based generation")
-            llm_configs = {}
+        result = self._call_llm_with_retry(prompt, system_prompt)
+        rows = result.get("agent_configs")
+        expected_ids = set(range(start_idx, start_idx + len(entities)))
+        if (not isinstance(rows, list) or len(rows) != len(entities)
+                or any(not isinstance(row, dict) or type(row.get("agent_id")) is not int for row in rows)
+                or {row["agent_id"] for row in rows} != expected_ids):
+            raise RuntimeError("AI simulation configuration omitted or duplicated agents; retry preparation")
+        llm_configs = {cfg["agent_id"]: cfg for cfg in rows}
 
         # Build AgentActivityConfig objects
         configs = []
         for i, entity in enumerate(entities):
             agent_id = start_idx + i
             cfg = llm_configs.get(agent_id, {})
-
-            # If LLM didn't generate, use rule-based generation
-            if not cfg:
-                cfg = self._generate_agent_config_by_rule(entity)
 
             config = AgentActivityConfig(
                 agent_id=agent_id,

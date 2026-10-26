@@ -6,6 +6,7 @@ Supports Ollama num_ctx parameter to prevent prompt truncation
 
 import json
 import logging
+import math
 import os
 import re
 from typing import Optional, Dict, Any, List
@@ -98,7 +99,7 @@ class LLMClient:
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         model: Optional[str] = None,
-        timeout: float = 300.0
+        timeout: Optional[float] = None
     ):
         self.api_key = api_key or Config.LLM_API_KEY
         self.base_url = base_url or Config.LLM_BASE_URL
@@ -107,10 +108,16 @@ class LLMClient:
         if not self.api_key:
             raise ValueError("LLM_API_KEY not configured")
 
+        request_timeout = timeout if timeout is not None else float(os.getenv("LLM_TIMEOUT_SECONDS", "300"))
+        if not math.isfinite(request_timeout) or request_timeout <= 0:
+            raise ValueError("LLM timeout must be a finite positive number of seconds")
         self.client = OpenAI(
             api_key=self.api_key,
             base_url=self.base_url,
-            timeout=timeout,
+            timeout=request_timeout,
+            # Surface the configured deadline once. Hidden SDK retries can
+            # multiply a slow model's work and keep failed tasks alive.
+            max_retries=0,
         )
 
         # Ollama context window size — prevents prompt truncation for the

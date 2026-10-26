@@ -8,7 +8,7 @@ import re
 import traceback
 import threading
 from contextlib import ExitStack, nullcontext
-from flask import request, jsonify
+from flask import request, jsonify, current_app
 from zep_cloud import NotFoundError
 
 from . import graph_bp
@@ -108,6 +108,10 @@ def _project_build_lock(project_id: str) -> threading.Lock:
 
 
 def _project_has_active_build(project) -> bool:
+    ontology_task_id = getattr(project, "ontology_task_id", None)
+    ontology_task = TaskManager().get_task(ontology_task_id) if ontology_task_id else None
+    if ontology_task and ontology_task.status in {TaskStatus.PENDING, TaskStatus.PROCESSING}:
+        return True
     if project.status != ProjectStatus.GRAPH_BUILDING:
         return False
     if not project.graph_build_task_id:
@@ -192,6 +196,8 @@ def _delete_project_impl(project_id: str):
     with graph_guard:
         try:
             _delete_cloud_graph_if_present(graph_id)
+            for attempt in project.previous_graph_attempts:
+                _delete_cloud_graph_if_present(attempt.get("graph_id"))
         except GraphInUseError as error:
             return jsonify({"success": False, "error": str(error)}), 409
         # The local reference remains protected until it is removed, so a new
@@ -271,6 +277,17 @@ def _form_bool(field_name: str, default: bool = False) -> bool:
 
 @graph_bp.route('/ontology/generate', methods=['POST'])
 def generate_ontology():
+    project_id = request.form.get('project_id', '').strip()
+    if project_id:
+        with _project_build_lock(project_id):
+            project = ProjectManager.get_project(project_id)
+            if project and _project_has_active_build(project):
+                return jsonify({"success": False, "error": "Project generation is still active"}), 409
+            return _generate_ontology_impl()
+    return _generate_ontology_impl()
+
+
+def _generate_ontology_impl():
     """
     Upload one or more files and generate ontology.
 
@@ -283,7 +300,7 @@ def generate_ontology():
         logger.info("=== Start ontology generation ===")
 
         simulation_requirement = request.form.get('simulation_requirement', '').strip()
-        project_name = request.form.get('project_name', 'Unnamed Project').strip() or 'Unnamed Project'
+        project_name = request.form.get('project_name', '').strip()
         additional_context = request.form.get('additional_context', '').strip()
         project_id = request.form.get('project_id', '').strip()
         defer_ontology = _form_bool('defer_ontology', default=False)
@@ -316,7 +333,7 @@ def generate_ontology():
                     "error": t('api.requireSimulationRequirement')
                 }), 400
 
-            project = ProjectManager.create_project(name=project_name)
+            project = ProjectManager.create_project(name=project_name or 'Unnamed Project')
             project.simulation_requirement = simulation_requirement
             logger.info(f"Create project: {project.project_id}")
 
@@ -404,89 +421,131 @@ def generate_ontology():
                 "error": "Extracted document text is empty; cannot generate ontology"
             }), 400
 
-        logger.info("Calling LLM to generate ontology...")
-        generator = OntologyGenerator()
-        ontology = generator.generate(
-            document_texts=[all_text],
-            simulation_requirement=simulation_requirement,
-            additional_context=additional_context if additional_context else None
-        )
+        if _form_bool('async_ontology', default=False):
+            manager = TaskManager()
+            task_id = manager.create_task("ontology", metadata={"project_id": project.project_id})
+            project.ontology_task_id = task_id
+            project.error = None
+            ProjectManager.save_project(project)
+            app = current_app._get_current_object()
+            locale = get_locale()
 
-        entity_count = len(ontology.get("entity_types", []))
-        edge_count = len(ontology.get("edge_types", []))
-        logger.info(f"Ontology generated: entities={entity_count}, edges={edge_count}")
+            def generate_in_background():
+                with app.app_context():
+                    set_locale(locale)
+                    manager.update_task(task_id, status=TaskStatus.PROCESSING, message="Generating ontology")
+                    try:
+                        result = _generate_project_ontology(
+                            project, all_text, simulation_requirement, additional_context
+                        )
+                        manager.complete_task(task_id, result["data"])
+                    except Exception as error:
+                        response, _status = _ontology_failure(error, project)
+                        manager.fail_task(task_id, response.get_json()["error"])
 
-        project.ontology = {
-            "entity_types": ontology.get("entity_types", []),
-            "edge_types": ontology.get("edge_types", [])
-        }
-        project.analysis_summary = ontology.get("analysis_summary", "")
-        project.status = ProjectStatus.ONTOLOGY_GENERATED
-        ProjectManager.save_project(project)
-        logger.info(f"=== Ontology generation completed === project={project.project_id}")
-
-        return jsonify({
-            "success": True,
-            "data": {
-                "project_id": project.project_id,
-                "project_name": project.name,
-                "ontology": project.ontology,
-                "analysis_summary": project.analysis_summary,
-                "files": project.files,
-                "total_text_length": project.total_text_length
-            }
-        })
-        
-    except Exception as error:
-        provider_status = getattr(error, "status_code", None)
-        request_id = getattr(error, "request_id", None)
-
-        if isinstance(error, LLMResponseError):
-            public_error = str(error)
-            response_status = 502
-            logger.exception("LLM returned an unusable ontology response")
-        elif isinstance(provider_status, int):
-            public_error = f"LLM provider request failed (HTTP {provider_status})"
-            if request_id:
-                safe_request_id = re.sub(
-                    r"[^a-zA-Z0-9._:-]", "", str(request_id)
-                )[:128]
-                if safe_request_id:
-                    public_error += f" (request_id: {safe_request_id})"
-            response_status = 502
-            # Provider exception bodies may echo request content. Keep the
-            # server log useful without serializing the exception body.
-            logger.error(
-                "Ontology provider request failed: type=%s status=%s request_id=%s",
-                type(error).__name__,
-                provider_status,
-                request_id or "unknown",
-            )
-        else:
-            public_error = "Ontology generation failed; check the server logs"
-            response_status = 500
-            logger.exception("Unexpected ontology generation failure")
-
-        response_data = None
-        if project is not None:
-            project.status = ProjectStatus.FAILED
-            project.error = public_error
             try:
-                ProjectManager.save_project(project)
+                threading.Thread(target=generate_in_background, daemon=True).start()
             except Exception:
-                logger.exception(
-                    "Failed to persist ontology failure for project %s",
-                    project.project_id,
-                )
-            response_data = {"project_id": project.project_id}
+                manager.fail_task(task_id, "Could not start ontology generation")
+                raise
+            return jsonify({"success": True, "data": {
+                "project_id": project.project_id, "task_id": task_id,
+                "async_ontology": True,
+            }}), 202
+        return jsonify(_generate_project_ontology(
+            project, all_text, simulation_requirement, additional_context
+        ))
+    except Exception as error:
+        return _ontology_failure(error, project)
 
-        payload = {
-            "success": False,
-            "error": public_error,
+
+def _generate_project_ontology(project, all_text, simulation_requirement, additional_context):
+    logger.info("Calling LLM to generate ontology...")
+    generator = OntologyGenerator()
+    ontology = generator.generate(
+        document_texts=[all_text],
+        simulation_requirement=simulation_requirement,
+        additional_context=additional_context if additional_context else None
+    )
+
+    entity_count = len(ontology.get("entity_types", []))
+    edge_count = len(ontology.get("edge_types", []))
+    logger.info(f"Ontology generated: entities={entity_count}, edges={edge_count}")
+
+    project.ontology = {
+        "entity_types": ontology.get("entity_types", []),
+        "edge_types": ontology.get("edge_types", [])
+    }
+    project.analysis_summary = ontology.get("analysis_summary", "")
+    project.status = ProjectStatus.ONTOLOGY_GENERATED
+    ProjectManager.save_project(project)
+    logger.info(f"=== Ontology generation completed === project={project.project_id}")
+
+    return {
+        "success": True,
+        "data": {
+            "project_id": project.project_id,
+            "project_name": project.name,
+            "ontology": project.ontology,
+            "analysis_summary": project.analysis_summary,
+            "files": project.files,
+            "total_text_length": project.total_text_length
         }
-        if response_data is not None:
-            payload["data"] = response_data
-        return jsonify(payload), response_status
+    }
+
+
+
+def _ontology_failure(error, project):
+    provider_status = getattr(error, "status_code", None)
+    request_id = getattr(error, "request_id", None)
+
+    if isinstance(error, LLMResponseError):
+        public_error = str(error)
+        response_status = 502
+        logger.exception("LLM returned an unusable ontology response")
+    elif isinstance(provider_status, int):
+        public_error = f"LLM provider request failed (HTTP {provider_status})"
+        if request_id:
+            safe_request_id = re.sub(
+                r"[^a-zA-Z0-9._:-]", "", str(request_id)
+            )[:128]
+            if safe_request_id:
+                public_error += f" (request_id: {safe_request_id})"
+        response_status = 502
+        # Provider exception bodies may echo request content. Keep the
+        # server log useful without serializing the exception body.
+        logger.error(
+            "Ontology provider request failed: type=%s status=%s request_id=%s",
+            type(error).__name__,
+            provider_status,
+            request_id or "unknown",
+        )
+    else:
+        public_error = "Ontology generation failed; check the server logs"
+        response_status = 500
+        logger.exception("Unexpected ontology generation failure")
+
+    response_data = None
+    if project is not None:
+        project.status = ProjectStatus.FAILED
+        project.error = public_error
+        try:
+            ProjectManager.save_project(project)
+        except Exception:
+            logger.exception(
+                "Failed to persist ontology failure for project %s",
+                project.project_id,
+            )
+        response_data = {"project_id": project.project_id}
+
+    payload = {
+        "success": False,
+        "error": public_error,
+    }
+    if response_data is not None:
+        payload["data"] = response_data
+    return jsonify(payload), response_status
+
 
 
 # ============== 接口2：构建图谱 ==============
@@ -530,7 +589,7 @@ def _build_graph_impl():
         
         # 检查配置
         errors = []
-        if not Config.ZEP_API_KEY:
+        if Config.GRAPH_BACKEND != "local" and not Config.ZEP_API_KEY:
             errors.append(t('api.zepApiKeyMissing'))
         if errors:
             logger.error(f"配置错误: {errors}")
@@ -560,6 +619,9 @@ def _build_graph_impl():
 
         # 检查项目状态
         force = data.get('force', False)  # 强制重新构建
+        preserve_failed = data.get('preserve_failed_graph', False)
+        if not isinstance(preserve_failed, bool):
+            return jsonify({"success": False, "error": "preserve_failed_graph must be a JSON boolean"}), 400
         if not isinstance(force, bool):
             return jsonify({
                 "success": False,
@@ -608,7 +670,7 @@ def _build_graph_impl():
                     "batch cannot be resumed automatically"
                 )
                 ProjectManager.save_project(project)
-                if not force:
+                if not force and not preserve_failed:
                     return jsonify({
                         "success": False,
                         "error": project.error,
@@ -669,6 +731,17 @@ def _build_graph_impl():
             force and project.status == ProjectStatus.GRAPH_COMPLETED
         ):
             graph_id_to_delete = project.graph_id
+            if preserve_failed and project.status == ProjectStatus.FAILED and graph_id_to_delete:
+                if len(project.previous_graph_attempts) >= 50:
+                    return jsonify({"success": False, "error": "Review prior graph attempts before starting another build"}), 409
+                project.previous_graph_attempts.append({
+                    "graph_id": graph_id_to_delete,
+                    "batch_id": project.zep_batch_id,
+                    "operation_id": project.zep_batch_operation_id,
+                    "task_id": project.graph_build_task_id,
+                    "error": project.error,
+                })
+                graph_id_to_delete = None
             graph_guard = (
                 graph_lifecycle_lock(graph_id_to_delete)
                 if graph_id_to_delete
@@ -846,19 +919,19 @@ def _build_graph_impl():
                 
             except Exception as e:
                 # 更新项目状态为失败
-                build_logger.error(f"[{task_id}] 图谱构建失败: {str(e)}")
-                build_logger.debug(traceback.format_exc())
+                public_error = "Graph build failed. Check graph service health before retrying."
+                build_logger.error("[%s] Graph build failed (%s)", task_id, type(e).__name__)
                 
                 with _project_build_lock(project_id):
                     project.status = ProjectStatus.FAILED
-                    project.error = str(e)
+                    project.error = public_error
                     ProjectManager.save_project(project)
 
                     task_manager.update_task(
                         task_id,
                         status=TaskStatus.FAILED,
-                        message=t('progress.buildFailed', error=str(e)),
-                        error=traceback.format_exc()
+                        message=t('progress.buildFailed', error=public_error),
+                        error=public_error
                     )
         
         # 启动后台线程
@@ -878,10 +951,10 @@ def _build_graph_impl():
     except GraphInUseError as e:
         return jsonify({"success": False, "error": str(e)}), 409
     except Exception as e:
+        logger.error("Could not start graph build (%s)", type(e).__name__)
         return jsonify({
             "success": False,
-            "error": str(e),
-            "traceback": traceback.format_exc()
+            "error": "Could not start graph build; check the graph service and server logs"
         }), 500
 # ============== 任务查询接口 ==============
 
@@ -926,7 +999,7 @@ def get_graph_data(graph_id: str):
     获取图谱数据（节点和边）
     """
     try:
-        if not Config.ZEP_API_KEY:
+        if Config.GRAPH_BACKEND != "local" and not Config.ZEP_API_KEY:
             return jsonify({
                 "success": False,
                 "error": t('api.zepApiKeyMissing')
@@ -954,7 +1027,7 @@ def delete_graph(graph_id: str):
     删除Zep图谱
     """
     try:
-        if not Config.ZEP_API_KEY:
+        if Config.GRAPH_BACKEND != "local" and not Config.ZEP_API_KEY:
             return jsonify({
                 "success": False,
                 "error": t('api.zepApiKeyMissing')

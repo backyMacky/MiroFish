@@ -362,8 +362,8 @@ class SimulationRunner:
         
         data = state.to_detail_dict()
         
-        with open(state_file, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        from ..utils.fileio import atomic_write_json
+        atomic_write_json(state_file, data)
         
         cls._run_states[state.simulation_id] = state
     
@@ -637,6 +637,7 @@ class SimulationRunner:
         
         monitor_error: Exception | None = None
         exit_code: int | None = None
+        loops_completed = False
         try:
             while process.poll() is None:  # 进程仍在运行
                 # 读取 Twitter 动作日志
@@ -651,6 +652,13 @@ class SimulationRunner:
                         reddit_actions_log, reddit_position, state, "reddit"
                     )
                 
+                # OASIS keeps its IPC environment alive for interviews after
+                # both producers finish. Waiting for process exit here would
+                # prevent the graph drain and reports from ever completing.
+                if (cls._check_all_platforms_completed(state)
+                        and simulation_id not in cls._manual_stop_requests):
+                    loops_completed = True
+                    break
                 # 更新状态
                 cls._save_run_state(state)
                 time.sleep(2)
@@ -661,7 +669,7 @@ class SimulationRunner:
             if os.path.exists(reddit_actions_log):
                 cls._read_action_log(reddit_actions_log, reddit_position, state, "reddit")
             
-            exit_code = process.returncode
+            exit_code = 0 if loops_completed else process.returncode
             
         except Exception as e:
             logger.error(f"监控线程异常: {simulation_id}, error={str(e)}")
@@ -744,24 +752,27 @@ class SimulationRunner:
                         logger.error(f"模拟失败: {simulation_id}, error={state.error}")
                 cls._manual_stop_requests.discard(simulation_id)
             
-            # 清理进程资源
-            cls._processes.pop(simulation_id, None)
-            cls._action_queues.pop(simulation_id, None)
             cls._monitor_threads.pop(simulation_id, None)
-            
-            # 关闭日志文件句柄
-            if simulation_id in cls._stdout_files:
-                try:
-                    cls._stdout_files[simulation_id].close()
-                except Exception:
-                    pass
-                cls._stdout_files.pop(simulation_id, None)
-            if simulation_id in cls._stderr_files and cls._stderr_files[simulation_id]:
-                try:
-                    cls._stderr_files[simulation_id].close()
-                except Exception:
-                    pass
-                cls._stderr_files.pop(simulation_id, None)
+            if loops_completed and process.poll() is None:
+                threading.Thread(target=cls._reap_environment, args=(simulation_id, process), daemon=True).start()
+            else:
+                cls._release_process_resources(simulation_id, process)
+
+    @classmethod
+    def _reap_environment(cls, simulation_id, process):
+        process.wait()
+        cls._release_process_resources(simulation_id, process)
+
+    @classmethod
+    def _release_process_resources(cls, simulation_id, process):
+        if cls._processes.get(simulation_id) is not process:
+            return
+        cls._processes.pop(simulation_id, None)
+        cls._action_queues.pop(simulation_id, None)
+        for streams in (cls._stdout_files, cls._stderr_files):
+            stream = streams.pop(simulation_id, None)
+            if stream:
+                stream.close()
     
     @classmethod
     def _read_action_log(
@@ -893,8 +904,8 @@ class SimulationRunner:
         reddit_log = os.path.join(sim_dir, "reddit", "actions.jsonl")
         
         # 检查哪些平台被启用（通过文件是否存在判断）
-        twitter_enabled = os.path.exists(twitter_log)
-        reddit_enabled = os.path.exists(reddit_log)
+        twitter_enabled = state.twitter_running or state.twitter_completed or os.path.exists(twitter_log)
+        reddit_enabled = state.reddit_running or state.reddit_completed or os.path.exists(reddit_log)
         
         # 如果平台被启用但未完成，则返回 False
         if twitter_enabled and not state.twitter_completed:
@@ -962,7 +973,7 @@ class SimulationRunner:
                 process.wait(timeout=5)
     
     @classmethod
-    def stop_simulation(cls, simulation_id: str) -> SimulationRunState:
+    def stop_simulation(cls, simulation_id: str, *, wait_timeout: float | None = None) -> SimulationRunState:
         """停止模拟"""
         with cls._finalization_lock(simulation_id):
             state = cls.get_run_state(simulation_id)
@@ -987,6 +998,8 @@ class SimulationRunner:
                     RunnerStatus.STOPPING,
                 ]
                 and not retrying_finalization
+                and not (state.runner_status == RunnerStatus.COMPLETED
+                         and cls._processes.get(simulation_id) is not None)
             ):
                 raise ValueError(
                     f"模拟未在运行: {simulation_id}, status={state.runner_status}"
@@ -1023,7 +1036,7 @@ class SimulationRunner:
             and monitor is not threading.current_thread()
             and monitor.is_alive()
         ):
-            wait_timeout = max(
+            wait_timeout = wait_timeout if wait_timeout is not None else max(
                 30.0,
                 ZEP_INGESTION_WAIT_TIMEOUT_SECONDS
                 + ZEP_HTTP_REQUEST_TIMEOUT_SECONDS
@@ -1081,6 +1094,8 @@ class SimulationRunner:
             )
 
         logger.info(f"模拟已停止: {simulation_id}")
+        if process is not None and process.poll() is not None:
+            cls._release_process_resources(simulation_id, process)
         return state
 
     @classmethod
@@ -1384,64 +1399,41 @@ class SimulationRunner:
         Returns:
             清理结果信息
         """
-        import shutil
-        
-        sim_dir = os.path.join(cls.RUN_STATE_DIR, simulation_id)
-        
-        if not os.path.exists(sim_dir):
-            return {"success": True, "message": "模拟目录不存在，无需清理"}
-        
-        cleaned_files = []
+        from pathlib import Path
+        import uuid
+
+        root = Path(cls.RUN_STATE_DIR).resolve()
+        directory = (root / simulation_id).resolve()
+        if directory.parent != root or not simulation_id or Path(simulation_id).name != simulation_id:
+            raise ValueError("Invalid simulation directory")
+        process = cls._processes.get(simulation_id)
+        if process is not None and process.poll() is None:
+            return {"success": False, "errors": ["Close the existing environment before restarting"]}
+        if not directory.exists():
+            return {"success": True, "cleaned_files": []}
+        archive = directory / 'run_attempts' / uuid.uuid4().hex
+        names = ['run_state.json', 'simulation.log', 'stdout.log', 'stderr.log',
+                 'env_status.json', 'twitter/actions.jsonl', 'reddit/actions.jsonl']
+        for platform in ('twitter', 'reddit'):
+            names.extend(platform + '_simulation.db' + suffix for suffix in ('', '-wal', '-shm'))
+        moved = []
         errors = []
-        
-        # 要删除的文件列表（包括数据库文件）
-        files_to_delete = [
-            "run_state.json",
-            "simulation.log",
-            "stdout.log",
-            "stderr.log",
-            "twitter_simulation.db",  # Twitter 平台数据库
-            "reddit_simulation.db",   # Reddit 平台数据库
-            "env_status.json",        # 环境状态文件
-        ]
-        
-        # 要删除的目录列表（包含动作日志）
-        dirs_to_clean = ["twitter", "reddit"]
-        
-        # 删除文件
-        for filename in files_to_delete:
-            file_path = os.path.join(sim_dir, filename)
-            if os.path.exists(file_path):
+        for name in names:
+            source = directory / name
+            if source.is_file():
                 try:
-                    os.remove(file_path)
-                    cleaned_files.append(filename)
-                except Exception as e:
-                    errors.append(f"删除 {filename} 失败: {str(e)}")
-        
-        # 清理平台目录中的动作日志
-        for dir_name in dirs_to_clean:
-            dir_path = os.path.join(sim_dir, dir_name)
-            if os.path.exists(dir_path):
-                actions_file = os.path.join(dir_path, "actions.jsonl")
-                if os.path.exists(actions_file):
-                    try:
-                        os.remove(actions_file)
-                        cleaned_files.append(f"{dir_name}/actions.jsonl")
-                    except Exception as e:
-                        errors.append(f"删除 {dir_name}/actions.jsonl 失败: {str(e)}")
-        
-        # 清理内存中的运行状态
-        if simulation_id in cls._run_states:
-            del cls._run_states[simulation_id]
-        
-        logger.info(f"清理模拟日志完成: {simulation_id}, 删除文件: {cleaned_files}")
-        
-        return {
-            "success": len(errors) == 0,
-            "cleaned_files": cleaned_files,
-            "errors": errors if errors else None
-        }
-    
+                    destination = archive / name
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(source, destination)
+                    moved.append(name)
+                except OSError:
+                    errors.append('Could not archive ' + name)
+        if not errors:
+            cls._run_states.pop(simulation_id, None)
+        return {"success": not errors, "cleaned_files": moved,
+                "archive_directory": str(archive) if moved else None,
+                "errors": errors or None}
+
     # 防止重复清理的标志
     _cleanup_done = False
     

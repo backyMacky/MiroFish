@@ -33,6 +33,9 @@ dependencies = [
     # 工具库
     "python-dotenv>=1.0.0",
     "pydantic>=2.0.0",
+    "filelock>=3.16.0",
+    # Docker uses CPU inference; avoid several GB of unused CUDA wheels.
+    "torch==2.9.1",
 ]
 
 [project.optional-dependencies]
@@ -54,3 +57,11 @@ dev = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["app"]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

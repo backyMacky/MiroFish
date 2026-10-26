@@ -1,13 +1,11 @@
 import axios from 'axios'
 import i18n from '../i18n'
+import { apiRoot } from './urls'
 
 // 创建axios实例
-// Default to a RELATIVE base ('/api') so the app works behind any mount point —
-// local dev ('/'), nginx prod ('/p/mirofish/'), or custom BASE_URL.
-// Vite exposes BASE_URL from vite.config's `base` option; concatenating 'api/'
-// yields `/api/` for local dev and `/p/mirofish/api/` in prod.
+// API modules already include /api/. Prefix only the plugin mount directory.
 const service = axios.create({
-  baseURL: import.meta.env.VITE_API_BASE_URL || (import.meta.env.BASE_URL + 'api').replace(/\/+api$/, '/api'),
+  baseURL: apiRoot(import.meta.env.VITE_API_BASE_URL, import.meta.env.BASE_URL),
   timeout: 300000, // 5分钟超时（本体生成可能需要较长时间）
   headers: {
     'Content-Type': 'application/json'

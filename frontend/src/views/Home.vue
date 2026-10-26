@@ -251,6 +251,8 @@ const triggerFileInput = () => {
 const handleFileSelect = (event) => {
   const selectedFiles = Array.from(event.target.files)
   addFiles(selectedFiles)
+  // Allow choosing the same file again after removing it from the draft.
+  event.target.value = ''
 }
 
 // 处理拖拽相关

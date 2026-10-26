@@ -38,7 +38,7 @@
     <!-- Main Content Area -->
     <main class="content-area">
       <!-- Left Panel: Graph -->
-      <div class="panel-wrapper left" :style="leftPanelStyle">
+      <div class="panel-wrapper left" :style="leftPanelStyle" :inert="viewMode === 'workbench'" :aria-hidden="viewMode === 'workbench'">
         <GraphPanel 
           :graphData="graphData"
           :loading="graphLoading"
@@ -49,7 +49,7 @@
       </div>
 
       <!-- Right Panel: Step2 环境搭建 -->
-      <div class="panel-wrapper right" :style="rightPanelStyle">
+      <div class="panel-wrapper right" :style="rightPanelStyle" :inert="viewMode === 'graph'" :aria-hidden="viewMode === 'graph'">
         <Step2EnvSetup
           :simulationId="currentSimulationId"
           :projectData="projectData"
@@ -288,6 +288,8 @@ const loadGraph = async (graphId) => {
 const refreshGraph = () => {
   if (projectData.value?.graph_id) {
     loadGraph(projectData.value.graph_id)
+  } else {
+    loadSimulationData()
   }
 }
 

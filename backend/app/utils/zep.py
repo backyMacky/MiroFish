@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
+import math
 import time
+import threading
 from functools import lru_cache
 from typing import Any, Callable, TypeVar
 
@@ -28,6 +30,16 @@ ZEP_HTTP_REQUEST_TIMEOUT_SECONDS = 60.0
 ZEP_INGESTION_WAIT_TIMEOUT_SECONDS = 600
 MAX_ZEP_SEARCH_QUERY_CHARS = 400
 MAX_ZEP_SEARCH_RESULTS = 50
+
+
+def ingestion_wait_timeout(default=ZEP_INGESTION_WAIT_TIMEOUT_SECONDS):
+    """Keep Cloud's bound; let a local CPU deployment budget its ingest queue."""
+    if Config.GRAPH_BACKEND != 'local':
+        return default
+    timeout = float(os.getenv('LOCAL_GRAPH_INGESTION_WAIT_TIMEOUT_SECONDS', str(default)))
+    if not math.isfinite(timeout) or not 1 <= timeout <= 7200:
+        raise ValueError('Local graph ingestion wait must be from 1 to 7200 seconds')
+    return timeout
 
 
 def normalize_zep_search_query(query: Any) -> str:
@@ -71,6 +83,9 @@ def get_zep_client(api_key: str | None = None, timeout: float | None = None) -> 
     if os.environ.get("ZEP_API_URL"):
         raise ValueError("ZEP_API_URL is unsupported; unset it to use Zep Cloud")
 
+    if Config.GRAPH_BACKEND == "local":
+        return _cached_local_graph_client()
+
     normalized_key = (api_key or Config.ZEP_API_KEY or "").strip()
     if not normalized_key:
         raise ValueError("ZEP_API_KEY 未配置")
@@ -83,10 +98,28 @@ def get_zep_client(api_key: str | None = None, timeout: float | None = None) -> 
     return _cached_zep_client(normalized_key, request_timeout)
 
 
+_local_client = None
+_local_client_lock = threading.RLock()
+
+
+def _cached_local_graph_client():
+    global _local_client
+    from ..services.local_graph_client import LocalGraphClient
+    with _local_client_lock:
+        if _local_client is None:
+            _local_client = LocalGraphClient()
+        return _local_client
+
+
 def clear_zep_client_cache() -> None:
     """Clear cached clients. Intended for tests and controlled reconfiguration."""
 
     _cached_zep_client.cache_clear()
+    global _local_client
+    with _local_client_lock:
+        if _local_client is not None:
+            _local_client.close()
+            _local_client = None
 
 
 def is_retryable_zep_error(error: BaseException) -> bool:

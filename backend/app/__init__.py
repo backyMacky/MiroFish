@@ -53,8 +53,6 @@ def create_app(config_class=Config):
     def log_request():
         logger = get_logger('mirofish.request')
         logger.debug(f"请求: {request.method} {request.path}")
-        if request.content_type and 'json' in request.content_type:
-            logger.debug(f"请求体: {request.get_json(silent=True)}")
     
     @app.after_request
     def log_response(response):
@@ -71,6 +69,11 @@ def create_app(config_class=Config):
     # 健康检查
     @app.route('/health')
     def health():
+        if Config.GRAPH_BACKEND == 'local':
+            from .utils.zep import get_zep_client
+            graph_health = get_zep_client().health()
+            return {'status': 'ok' if graph_health['ok'] else 'degraded',
+                    'service': 'MiroFish Backend', 'graph': graph_health}, 200 if graph_health['ok'] else 503
         return {'status': 'ok', 'service': 'MiroFish Backend'}
     
     if should_log_startup:
