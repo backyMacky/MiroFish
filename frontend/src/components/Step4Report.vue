@@ -1,5 +1,10 @@
 <template>
   <div class="report-panel">
+    <div v-if="isFailed" class="report-failure" role="alert">
+      <strong>{{ $t('api.reportGenerateFailed') }}</strong>
+      <span>{{ failureMessage }}</span>
+      <button type="button" :disabled="isRetrying || !simulationId" @click="retryReport">{{ isRetrying ? $t('common.loading') : $t('common.retry') }}</button>
+    </div>
     <!-- Main Split Layout -->
     <div class="main-split-layout">
       <!-- LEFT PANEL: Report Style -->
@@ -67,12 +72,12 @@
 
         <!-- Waiting State -->
         <div v-if="!reportOutline" class="waiting-placeholder">
-          <div class="waiting-animation">
+          <div v-if="!isFailed" class="waiting-animation">
             <div class="waiting-ring"></div>
             <div class="waiting-ring"></div>
             <div class="waiting-ring"></div>
           </div>
-          <span class="waiting-text">Waiting for Report Agent...</span>
+          <span class="waiting-text">{{ isFailed ? $t('api.reportGenerateFailed') : 'Waiting for Report Agent...' }}</span>
         </div>
       </div>
 
@@ -393,7 +398,8 @@
 import { ref, computed, watch, onMounted, onUnmounted, nextTick, h, reactive } from 'vue'
 import { useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
-import { getAgentLog, getConsoleLog } from '../api/report'
+import { getAgentLog, getConsoleLog, generateReport } from '../api/report'
+import { startSerialPolling } from '../api/taskPolling'
 import { escapeHtml, renderMarkdown } from '../utils/markdown'
 
 const router = useRouter()
@@ -426,6 +432,11 @@ const expandedContent = ref(new Set())
 const expandedLogs = ref(new Set())
 const collapsedSections = ref(new Set())
 const isComplete = ref(false)
+const isFailed = ref(false)
+const failureMessage = ref('')
+const isRetrying = ref(false)
+const elapsedSeconds = ref(null)
+let pollGeneration = 0
 const startTime = ref(null)
 const leftPanel = ref(null)
 const rightPanel = ref(null)
@@ -1708,12 +1719,14 @@ const QuickSearchDisplay = {
 
 // Computed
 const statusClass = computed(() => {
+  if (isFailed.value) return 'failed'
   if (isComplete.value) return 'completed'
   if (agentLogs.value.length > 0) return 'processing'
   return 'pending'
 })
 
 const statusText = computed(() => {
+  if (isFailed.value) return t('common.error')
   if (isComplete.value) return 'Completed'
   if (agentLogs.value.length > 0) return 'Generating...'
   return 'Waiting'
@@ -1737,12 +1750,11 @@ const totalToolCalls = computed(() => {
 })
 
 const formatElapsedTime = computed(() => {
-  if (!startTime.value) return '0s'
   const lastLog = agentLogs.value[agentLogs.value.length - 1]
-  const elapsed = lastLog?.elapsed_seconds || 0
+  const elapsed = Math.max(0, Math.round(elapsedSeconds.value ?? lastLog?.elapsed_seconds ?? 0))
   if (elapsed < 60) return `${Math.round(elapsed)}s`
   const mins = Math.floor(elapsed / 60)
-  const secs = Math.round(elapsed % 60)
+  const secs = elapsed % 60
   return `${mins}m ${secs}s`
 })
 
@@ -1752,7 +1764,7 @@ const displayLogs = computed(() => {
 
 // Workflow steps overview (status-based, no nested cards)
 const activeSectionIndex = computed(() => {
-  if (isComplete.value) return null
+  if (isComplete.value || isFailed.value) return null
   if (currentSectionIndex.value) return currentSectionIndex.value
   if (totalSections.value > 0 && completedSections.value < totalSections.value) return completedSections.value + 1
   return null
@@ -1767,11 +1779,12 @@ const isPlanningStarted = computed(() => {
 })
 
 const isFinalizing = computed(() => {
-  return !isComplete.value && isPlanningDone.value && totalSections.value > 0 && completedSections.value >= totalSections.value
+  return !isComplete.value && !isFailed.value && isPlanningDone.value && totalSections.value > 0 && completedSections.value >= totalSections.value
 })
 
 // 当前活跃的步骤（用于顶部显示）
 const activeStep = computed(() => {
+  if (isFailed.value) return { noLabel: '!', title: t('api.reportGenerateFailed'), status: 'failed', meta: '' }
   const steps = workflowSteps.value
   // 找到当前 active 的步骤
   const active = steps.find(s => s.status === 'active')
@@ -1874,7 +1887,7 @@ const truncateText = (text, maxLen) => {
 
 
 const getTimelineItemClass = (log, idx, total) => {
-  const isLatest = idx === total - 1 && !isComplete.value
+  const isLatest = idx === total - 1 && !isComplete.value && !isFailed.value
   const isMilestone = log.action === 'section_complete' || log.action === 'report_complete'
   return {
     'node--active': isLatest,
@@ -1885,7 +1898,7 @@ const getTimelineItemClass = (log, idx, total) => {
 }
 
 const getConnectorClass = (log, idx, total) => {
-  const isLatest = idx === total - 1 && !isComplete.value
+  const isLatest = idx === total - 1 && !isComplete.value && !isFailed.value
   if (isLatest) return 'dot-active'
   if (log.action === 'section_complete' || log.action === 'report_complete') return 'dot-done'
   return 'dot-muted'
@@ -1918,13 +1931,18 @@ const getLogLevelClass = (log) => {
 let agentLogTimer = null
 let consoleLogTimer = null
 
-const fetchAgentLog = async () => {
+const fetchAgentLog = async (signal) => {
   if (!props.reportId) return
+  const reportId = props.reportId
+  const generation = pollGeneration
   
   try {
-    const res = await getAgentLog(props.reportId, agentLogLine.value)
+    const res = await getAgentLog(reportId, agentLogLine.value, signal)
+    if (signal?.aborted || generation !== pollGeneration || props.reportId !== reportId) return
     
     if (res.success && res.data) {
+      if (Number.isFinite(res.data.elapsed_seconds)) elapsedSeconds.value = res.data.elapsed_seconds
+      const failedLog = (res.data.logs || []).find(log => log.stage === 'failed')
       const newLogs = res.data.logs || []
       
       if (newLogs.length > 0) {
@@ -1962,8 +1980,6 @@ const fetchAgentLog = async () => {
           }
         })
         
-        agentLogLine.value = res.data.from_line + newLogs.length
-        
         nextTick(() => {
           if (rightPanel.value) {
             // 如果任务已完成，滚动到顶部；否则滚动到底部跟随最新日志
@@ -1975,9 +1991,22 @@ const fetchAgentLog = async () => {
           }
         })
       }
+      agentLogLine.value = res.data.total_lines ?? (res.data.from_line ?? agentLogLine.value) + newLogs.length
+      if (res.data.status === 'failed' || failedLog) {
+        isFailed.value = true
+        currentSectionIndex.value = null
+        failureMessage.value = res.data.error || failedLog?.details?.error || t('api.reportGenerateFailed')
+        emit('update-status', 'error')
+        stopPolling()
+      } else if (res.data.status === 'completed' && !isComplete.value) {
+        isComplete.value = true
+        currentSectionIndex.value = null
+        emit('update-status', 'completed')
+        stopPolling()
+      }
     }
   } catch (err) {
-    console.warn('Failed to fetch agent log:', err)
+    if (!signal?.aborted) console.warn('Failed to fetch agent log', err?.response?.status)
   }
 }
 
@@ -2026,11 +2055,14 @@ const extractFinalContent = (response) => {
   return null
 }
 
-const fetchConsoleLog = async () => {
+const fetchConsoleLog = async (signal) => {
   if (!props.reportId) return
+  const reportId = props.reportId
+  const generation = pollGeneration
   
   try {
-    const res = await getConsoleLog(props.reportId, consoleLogLine.value)
+    const res = await getConsoleLog(reportId, consoleLogLine.value, signal)
+    if (signal?.aborted || generation !== pollGeneration || props.reportId !== reportId) return
     
     if (res.success && res.data) {
       const newLogs = res.data.logs || []
@@ -2047,28 +2079,43 @@ const fetchConsoleLog = async () => {
       }
     }
   } catch (err) {
-    console.warn('Failed to fetch console log:', err)
+    if (!signal?.aborted) console.warn('Failed to fetch console log', err?.response?.status)
   }
 }
 
 const startPolling = () => {
   if (agentLogTimer || consoleLogTimer) return
   
-  fetchAgentLog()
-  fetchConsoleLog()
-  
-  agentLogTimer = setInterval(fetchAgentLog, 2000)
-  consoleLogTimer = setInterval(fetchConsoleLog, 1500)
+  agentLogTimer = startSerialPolling(fetchAgentLog, { intervalMs: 2000 })
+  consoleLogTimer = startSerialPolling(fetchConsoleLog, { intervalMs: 1500 })
 }
 
 const stopPolling = () => {
+  pollGeneration += 1
   if (agentLogTimer) {
-    clearInterval(agentLogTimer)
+    agentLogTimer()
     agentLogTimer = null
   }
   if (consoleLogTimer) {
-    clearInterval(consoleLogTimer)
+    consoleLogTimer()
     consoleLogTimer = null
+  }
+}
+
+const retryReport = async () => {
+  if (isRetrying.value || !props.simulationId) return
+  const reportId = props.reportId
+  const generation = pollGeneration
+  isRetrying.value = true
+  try {
+    const result = await generateReport({ simulation_id: props.simulationId, force_regenerate: true })
+    if (generation !== pollGeneration || props.reportId !== reportId) return
+    if (!result.success || !result.data?.report_id) throw new Error(result.error || t('api.reportGenerateFailed'))
+    await router.push({ name: 'Report', params: { reportId: result.data.report_id } })
+  } catch (error) {
+    if (generation === pollGeneration && props.reportId === reportId) failureMessage.value = error.message
+  } finally {
+    if (generation === pollGeneration) isRetrying.value = false
   }
 }
 
@@ -2085,6 +2132,7 @@ onUnmounted(() => {
 })
 
 watch(() => props.reportId, (newId) => {
+  stopPolling()
   if (newId) {
     agentLogs.value = []
     consoleLogs.value = []
@@ -2097,6 +2145,10 @@ watch(() => props.reportId, (newId) => {
     expandedLogs.value = new Set()
     collapsedSections.value = new Set()
     isComplete.value = false
+    isFailed.value = false
+    failureMessage.value = ''
+    isRetrying.value = false
+    elapsedSeconds.value = null
     startTime.value = null
     
     startPolling()
@@ -2105,6 +2157,8 @@ watch(() => props.reportId, (newId) => {
 </script>
 
 <style scoped>
+.report-failure { display: flex; gap: 12px; align-items: center; padding: 12px; color: #991b1b; background: #fff1f2; flex-shrink: 0; }
+.report-failure button { margin-left: auto; padding: 6px 12px; }
 .report-panel {
   height: 100%;
   display: flex;

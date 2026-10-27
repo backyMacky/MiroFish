@@ -13,6 +13,7 @@ import os
 import json
 import time
 import re
+import math
 from typing import Dict, Any, List, Optional, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -1835,6 +1836,7 @@ class ReportAgent:
             logger.error(t('report.reportGenFailed', error=str(e)))
             report.status = ReportStatus.FAILED
             report.error = str(e)
+            report.completed_at = datetime.now().isoformat()
             
             # 记录错误日志
             if self.report_logger:
@@ -2141,22 +2143,53 @@ class ReportManager:
         
         logs = []
         total_lines = 0
+        started_at = None
+        elapsed_seconds = 0.0
+        status = 'pending'
+        error = None
         
         with open(log_path, 'r', encoding='utf-8') as f:
             for i, line in enumerate(f):
+                if not line.endswith('\n'):
+                    # Retry a trailing row after its writer commits the newline.
+                    break
+                try:
+                    log_entry = json.loads(line.strip())
+                except json.JSONDecodeError:
+                    total_lines = i + 1
+                    continue
                 total_lines = i + 1
-                if i >= from_line:
+                if not isinstance(log_entry, dict):
+                    continue
+                if log_entry.get('action') == 'report_start':
                     try:
-                        log_entry = json.loads(line.strip())
-                        logs.append(log_entry)
-                    except json.JSONDecodeError:
-                        # 跳过解析失败的行
-                        continue
+                        started_at = datetime.fromisoformat(log_entry['timestamp'].replace('Z', '+00:00'))
+                    except (KeyError, TypeError, ValueError):
+                        pass
+                    status = 'generating'
+                value = log_entry.get('elapsed_seconds')
+                if isinstance(value, (int, float)) and math.isfinite(value) and value >= 0:
+                    elapsed_seconds = max(elapsed_seconds, value)
+                if log_entry.get('action') == 'report_complete':
+                    status = 'completed'
+                elif log_entry.get('stage') == 'failed':
+                    status = 'failed'
+                    details = log_entry.get('details')
+                    error = details.get('error') if isinstance(details, dict) else None
+                if i >= from_line:
+                    logs.append(log_entry)
+
+        if started_at is not None and status not in {'completed', 'failed'}:
+            now = datetime.now(started_at.tzinfo) if started_at.tzinfo else datetime.now()
+            elapsed_seconds = max(elapsed_seconds, (now - started_at).total_seconds())
         
         return {
             "logs": logs,
             "total_lines": total_lines,
             "from_line": from_line,
+            "elapsed_seconds": round(elapsed_seconds, 2),
+            "status": status,
+            "error": error,
             "has_more": False  # 已读取到末尾
         }
     

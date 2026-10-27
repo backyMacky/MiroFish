@@ -1,6 +1,7 @@
 """Provider failures cannot become invented outlines or completed report text."""
 
 import json
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -61,6 +62,7 @@ def test_failed_planning_persists_failure_and_never_generates_sections(agent, mo
     monkeypatch.setattr(reports.ReportManager, 'REPORTS_DIR', str(tmp_path / 'reports'))
     result = agent.generate_report(report_id='report-owned-failure')
     assert result.status == reports.ReportStatus.FAILED
+    assert datetime.fromisoformat(result.completed_at)
     assert 'TimeoutError' in result.error and sentinel not in result.error
     agent.llm.chat_json.assert_called_once()
     agent.llm.chat.assert_not_called()
@@ -94,3 +96,57 @@ def test_report_budgets_are_explicit_and_reject_invalid_values(monkeypatch, agen
                 patch.setenv(name, bad)
                 with pytest.raises(ValueError):
                     reports.ReportAgent('graph-owned', 'sim-owned', 'Brief', agent.llm, agent.zep_tools)
+
+
+@pytest.mark.parametrize('tz', [None, timezone.utc, timezone(timedelta(hours=5, minutes=30))])
+def test_agent_log_clock_advances_without_new_rows(monkeypatch, tmp_path, tz):
+    monkeypatch.setattr(reports.ReportManager, 'REPORTS_DIR', str(tmp_path))
+    folder = tmp_path / 'report-clock'
+    folder.mkdir()
+    row = {'action': 'report_start', 'timestamp': (datetime.now(tz) - timedelta(seconds=125)).isoformat(),
+           'elapsed_seconds': 0}
+    (folder / 'agent_log.jsonl').write_text(json.dumps(row) + '\n')
+    result = reports.ReportManager.get_agent_log('report-clock', from_line=1)
+    assert result['logs'] == []
+    assert result['total_lines'] == 1
+    assert result['status'] == 'generating'
+    assert 125 <= result['elapsed_seconds'] < 130
+
+
+@pytest.mark.parametrize('terminal, expected', [
+    ({'action': 'error', 'stage': 'failed', 'details': {'error': 'Provider timed out'}}, 'failed'),
+    ({'action': 'report_complete', 'stage': 'completed'}, 'completed'),
+])
+def test_terminal_log_clock_and_failure_survive_incremental_reads(monkeypatch, tmp_path, terminal, expected):
+    monkeypatch.setattr(reports.ReportManager, 'REPORTS_DIR', str(tmp_path))
+    folder = tmp_path / 'report-terminal'
+    folder.mkdir()
+    rows = [{'action': 'report_start', 'timestamp': '2020-01-01T00:00:00', 'elapsed_seconds': 0},
+            {**terminal, 'elapsed_seconds': 60.25}]
+    (folder / 'agent_log.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in rows))
+    result = reports.ReportManager.get_agent_log('report-terminal', from_line=2)
+    assert result['logs'] == []
+    assert result['status'] == expected
+    assert result['elapsed_seconds'] == 60.25
+    assert result['error'] == ('Provider timed out' if expected == 'failed' else None)
+
+
+def test_agent_log_retries_uncommitted_tail_without_skipping_or_duplicating(monkeypatch, tmp_path):
+    monkeypatch.setattr(reports.ReportManager, 'REPORTS_DIR', str(tmp_path))
+    folder = tmp_path / 'report-tail'
+    folder.mkdir()
+    path = folder / 'agent_log.jsonl'
+    start = json.dumps({'action': 'report_start', 'timestamp': 'invalid'}) + '\n'
+    final = json.dumps({'action': 'report_complete', 'elapsed_seconds': 5})
+    path.write_text(start + 'invalid committed row\n' + final[:10])
+    result = reports.ReportManager.get_agent_log('report-tail')
+    assert result['total_lines'] == 2
+    assert len(result['logs']) == 1
+    path.write_text(start + 'invalid committed row\n' + final)
+    assert reports.ReportManager.get_agent_log('report-tail', 2)['total_lines'] == 2
+    with path.open('a') as stream:
+        stream.write('\n')
+    result = reports.ReportManager.get_agent_log('report-tail', 2)
+    assert result['total_lines'] == 3
+    assert result['logs'] == [json.loads(final)]
+    assert result['status'] == 'completed'

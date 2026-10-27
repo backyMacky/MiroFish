@@ -54,12 +54,13 @@ async function mountInteraction(handle, componentName = 'Step5Interaction') {
     const stateComponent = { ...component, render: () => null }
     app = renderer.createApp({ setup: () => () => h(stateComponent, { simulationId: props.simulationId, reportId: props.reportId }) })
     app.use(i18n)
-    app.provide(routerKey, { push() {} })
+    const navigations = []
+    app.provide(routerKey, { push(location) { navigations.push(location) } })
     app.provide(ssrContextKey, { modules: new Set() })
     app.mixin({ created() { if (this.$options.__name === componentName) instance = this.$ } })
     app.mount({})
     await setImmediate()
-    return { state: instance.setupState, props, requests, service, close }
+    return { state: instance.setupState, props, requests, service, navigations, close }
   } catch (error) {
     await close()
     throw error
@@ -225,6 +226,111 @@ test('changing context aborts interview polling without resubmitting its command
     assert.equal(fixture.requests.find(item => item.url.includes('/interview/status/')).signal.aborted, true)
     assert.equal(fixture.requests.filter(item => item.method === 'post').length, 1)
     assert.deepEqual(errors, [])
+  } finally { reply.resolve(); await fixture.close() }
+})
+
+test('failed reports stop generation indicators and retain logs for explicit retry', async () => {
+  const fixture = await mountInteraction(async config => {
+    if (config.url.endsWith('/agent-log')) return { status: 'failed', elapsed_seconds: 901.4, total_lines: 3, logs: [
+      { action: 'report_start' },
+      { action: 'section_start', section_index: 1 },
+      { action: 'error', stage: 'failed', details: { error: 'Provider timed out' } },
+    ] }
+  }, 'Step4Report')
+  try {
+    const { state } = fixture
+    assert.equal(state.isFailed, true)
+    assert.equal(state.isComplete, false)
+    assert.equal(state.failureMessage, 'Provider timed out')
+    assert.equal(state.currentSectionIndex, null)
+    assert.equal(state.activeSectionIndex, null)
+    assert.equal(state.activeStep.status, 'failed')
+    assert.equal(state.statusClass, 'failed')
+    assert.equal(state.formatElapsedTime, '15m 1s')
+    assert.equal(state.agentLogs.length, 3)
+    assert.equal(fixture.requests.filter(r => r.method === 'post').length, 0)
+    assert.ok(fixture.requests.filter(r => r.url.includes('-log')).every(r => r.signal.aborted))
+  } finally { await fixture.close() }
+})
+
+test('report elapsed time advances on empty log polls and rounds minute boundaries', async () => {
+  let elapsed = 59.6
+  const fixture = await mountInteraction(async config => {
+    if (config.url.endsWith('/agent-log')) return { logs: [], total_lines: 7, elapsed_seconds: elapsed }
+  }, 'Step4Report')
+  try {
+    assert.equal(fixture.state.formatElapsedTime, '1m 0s')
+    assert.equal(fixture.state.agentLogLine, 7)
+    elapsed = 124
+    await fixture.state.fetchAgentLog()
+    assert.equal(fixture.state.formatElapsedTime, '2m 4s')
+    assert.equal(fixture.state.agentLogs.length, 0)
+  } finally { await fixture.close() }
+})
+
+test('report navigation aborts old polls and ignores their late logs', async () => {
+  const reply = deferred(), started = deferred()
+  const fixture = await mountInteraction(async config => {
+    if (config.url.includes('report_owned/agent-log')) {
+      started.resolve()
+      await reply.promise
+      return { logs: [{ action: 'report_complete' }], status: 'completed' }
+    }
+    if (config.url.includes('report_new/agent-log')) return { logs: [], elapsed_seconds: 3 }
+  }, 'Step4Report')
+  try {
+    await started.promise
+    fixture.props.reportId = 'report_new'
+    await nextTick()
+    reply.resolve()
+    await setImmediate()
+    assert.equal(fixture.state.isComplete, false)
+    assert.equal(fixture.state.elapsedSeconds, 3)
+    assert.deepEqual(fixture.state.agentLogs, [])
+    assert.ok(fixture.requests.find(r => r.url.includes('report_owned/agent-log')).signal.aborted)
+  } finally { reply.resolve(); await fixture.close() }
+})
+
+test('report retry submits once and navigates to the newly accepted report', async () => {
+  const reply = deferred(), started = deferred()
+  const fixture = await mountInteraction(async config => {
+    if (config.url.endsWith('/agent-log')) return { status: 'failed', logs: [] }
+    if (config.method === 'post' && config.url === '/api/report/generate') {
+      started.resolve()
+      await reply.promise
+      return { report_id: 'report_retry' }
+    }
+  }, 'Step4Report')
+  try {
+    const pending = fixture.state.retryReport()
+    await started.promise
+    await fixture.state.retryReport()
+    assert.equal(fixture.state.isRetrying, true)
+    reply.resolve()
+    await pending
+    const mutations = fixture.requests.filter(r => r.method === 'post')
+    assert.equal(mutations.length, 1)
+    assert.deepEqual(JSON.parse(mutations[0].data), { simulation_id: 'sim_owned', force_regenerate: true })
+    assert.deepEqual(fixture.navigations, [{ name: 'Report', params: { reportId: 'report_retry' } }])
+    assert.equal(fixture.state.isRetrying, false)
+  } finally { reply.resolve(); await fixture.close() }
+})
+
+test('leaving a failed report while retry is accepted does not navigate back', async () => {
+  const reply = deferred(), started = deferred()
+  const fixture = await mountInteraction(async config => {
+    if (config.url.endsWith('/agent-log')) return { status: 'failed', logs: [] }
+    if (config.method === 'post') { started.resolve(); await reply.promise; return { report_id: 'report_retry' } }
+  }, 'Step4Report')
+  try {
+    const pending = fixture.state.retryReport()
+    await started.promise
+    fixture.props.reportId = 'report_other'
+    await nextTick()
+    reply.resolve()
+    await pending
+    assert.deepEqual(fixture.navigations, [])
+    assert.equal(fixture.requests.filter(r => r.method === 'post').length, 1)
   } finally { reply.resolve(); await fixture.close() }
 })
 
