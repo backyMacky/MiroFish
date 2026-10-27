@@ -206,6 +206,7 @@ const refreshGraph = () => {
 // Watch route params
 watch(() => route.params.reportId, (newId) => {
   if (newId && newId !== currentReportId.value) {
+    currentStatus.value = 'processing'
     currentReportId.value = newId
     loadReportData()
   }

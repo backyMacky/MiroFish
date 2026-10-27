@@ -5,7 +5,7 @@ import { setImmediate } from 'node:timers/promises'
 import { createServer } from 'vite'
 import { createRenderer, h, nextTick, reactive, ssrContextKey } from 'vue'
 import { AxiosError } from 'axios'
-import { routerKey } from 'vue-router'
+import { routerKey, routeLocationKey } from 'vue-router'
 
 const deferred = () => {
   let resolve
@@ -43,7 +43,8 @@ async function mountInteraction(handle, componentName = 'Step5Interaction') {
       }
       return { status: 200, statusText: 'OK', config, headers: {}, data: { success: true, data } }
     }
-    const component = (await server.ssrLoadModule(`/src/components/${componentName}.vue`)).default
+    const directory = componentName.endsWith('View') ? 'views' : 'components'
+    const component = (await server.ssrLoadModule(`/src/${directory}/${componentName}.vue`)).default
     const i18n = (await server.ssrLoadModule('/src/i18n/index.js')).default
     const renderer = createRenderer({
       createElement: () => ({}), createComment: () => ({}), createText: () => ({}),
@@ -55,12 +56,14 @@ async function mountInteraction(handle, componentName = 'Step5Interaction') {
     app = renderer.createApp({ setup: () => () => h(stateComponent, { simulationId: props.simulationId, reportId: props.reportId }) })
     app.use(i18n)
     const navigations = []
+    const route = reactive({ params: { reportId: 'report_owned' } })
     app.provide(routerKey, { push(location) { navigations.push(location) } })
+    app.provide(routeLocationKey, route)
     app.provide(ssrContextKey, { modules: new Set() })
     app.mixin({ created() { if (this.$options.__name === componentName) instance = this.$ } })
     app.mount({})
     await setImmediate()
-    return { state: instance.setupState, props, requests, service, navigations, close }
+    return { state: instance.setupState, props, requests, service, navigations, route, close }
   } catch (error) {
     await close()
     throw error
@@ -332,6 +335,18 @@ test('leaving a failed report while retry is accepted does not navigate back', a
     assert.deepEqual(fixture.navigations, [])
     assert.equal(fixture.requests.filter(r => r.method === 'post').length, 1)
   } finally { reply.resolve(); await fixture.close() }
+})
+
+test('report header resets its failure when retry navigates to a new report', async () => {
+  const fixture = await mountInteraction(async () => ({}), 'ReportView')
+  try {
+    fixture.state.currentStatus = 'error'
+    fixture.route.params.reportId = 'report_retry'
+    await nextTick()
+    assert.equal(fixture.state.currentReportId, 'report_retry')
+    assert.equal(fixture.state.statusClass, 'processing')
+    assert.equal(fixture.state.statusText, 'Generating')
+  } finally { await fixture.close() }
 })
 
 test('API error logs omit request payloads, credentials and provider response bodies', async t => {
