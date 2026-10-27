@@ -439,6 +439,7 @@ const doStartSimulation = async (restart = false) => {
         phase.value = 0
         startError.value = res.data.error || t('log.simFailed')
         emit('update-status', 'error')
+        await fetchRunStatusDetail()
       } else {
         phase.value = 1
         startStatusPolling()
@@ -538,6 +539,13 @@ const fetchRunStatus = async (signal) => {
       // 检测模拟是否已完成（通过 runner_status 或平台完成状态判断）
       const isCompleted = data.runner_status === 'completed' || data.runner_status === 'stopped'
       const isFailed = data.runner_status === 'failed'
+
+      // Read the final log tail before stopPolling aborts the independent
+      // detail request. Short runs can finish between its first two ticks.
+      if (isFailed || isCompleted) {
+        await fetchRunStatusDetail(signal)
+        if (signal?.aborted) return
+      }
       
       // runner_status is authoritative because the backend only publishes a
       // terminal state after the Zep ingestion barrier has completed.
@@ -587,10 +595,12 @@ const checkPlatformsCompleted = (data) => {
 
 const fetchRunStatusDetail = async (signal) => {
   if (!props.simulationId) return
+  const simulationId = props.simulationId
+  const currentActionIds = actionIds.value
   
   try {
-    const res = await getRunStatusDetail(props.simulationId, signal)
-    if (signal?.aborted) return
+    const res = await getRunStatusDetail(simulationId, signal)
+    if (signal?.aborted || props.simulationId !== simulationId || actionIds.value !== currentActionIds) return
     
     if (res.success && res.data) {
       // 使用 all_actions 获取完整的动作列表

@@ -5,6 +5,7 @@ import { setImmediate } from 'node:timers/promises'
 import { createServer } from 'vite'
 import { createRenderer, h, nextTick, reactive, ssrContextKey } from 'vue'
 import { AxiosError } from 'axios'
+import { routerKey } from 'vue-router'
 
 const deferred = () => {
   let resolve
@@ -14,7 +15,7 @@ const deferred = () => {
 
 // Compile the real SFC and exercise reactive state/lifecycle without a DOM.
 // Only HTTP and the rendering host are fixtures; production event handlers run.
-async function mountInteraction(handle) {
+async function mountInteraction(handle, componentName = 'Step5Interaction') {
   globalThis.localStorage = { getItem: () => 'en' }
   globalThis.document = { addEventListener() {}, removeEventListener() {}, querySelector: () => null }
   const root = fileURLToPath(new URL('../', import.meta.url))
@@ -42,7 +43,7 @@ async function mountInteraction(handle) {
       }
       return { status: 200, statusText: 'OK', config, headers: {}, data: { success: true, data } }
     }
-    const component = (await server.ssrLoadModule('/src/components/Step5Interaction.vue')).default
+    const component = (await server.ssrLoadModule(`/src/components/${componentName}.vue`)).default
     const i18n = (await server.ssrLoadModule('/src/i18n/index.js')).default
     const renderer = createRenderer({
       createElement: () => ({}), createComment: () => ({}), createText: () => ({}),
@@ -53,8 +54,9 @@ async function mountInteraction(handle) {
     const stateComponent = { ...component, render: () => null }
     app = renderer.createApp({ setup: () => () => h(stateComponent, { simulationId: props.simulationId, reportId: props.reportId }) })
     app.use(i18n)
+    app.provide(routerKey, { push() {} })
     app.provide(ssrContextKey, { modules: new Set() })
-    app.mixin({ created() { if (this.$options.__name === 'Step5Interaction') instance = this.$ } })
+    app.mixin({ created() { if (this.$options.__name === componentName) instance = this.$ } })
     app.mount({})
     await setImmediate()
     return { state: instance.setupState, props, requests, service, close }
@@ -62,6 +64,35 @@ async function mountInteraction(handle) {
     await close()
     throw error
   }
+}
+
+for (const terminal of ['completed', 'stopped', 'failed']) {
+  test(`terminal ${terminal} status refreshes final actions before canceling detail polling`, async () => {
+    const initialDetail = deferred(), detailStarted = deferred()
+    let terminalVisible = false, detailCount = 0
+    const fixture = await mountInteraction(async config => {
+      if (config.url.endsWith('/run-status')) return { runner_status: terminalVisible ? terminal : 'running' }
+      if (config.url.endsWith('/run-status/detail')) {
+        if (++detailCount === 1) {
+          detailStarted.resolve()
+          await initialDetail.promise
+          return { all_actions: [] }
+        }
+        return { all_actions: [
+          { id: 'twitter-tail', agent_id: 0, platform: 'twitter', action_type: 'CREATE_POST' },
+          { id: 'reddit-tail', agent_id: 1, platform: 'reddit', action_type: 'CREATE_POST' },
+        ] }
+      }
+    }, 'Step3Simulation')
+    try {
+      await detailStarted.promise
+      terminalVisible = true
+      await fixture.state.fetchRunStatus()
+      assert.deepEqual(fixture.state.allActions.map(action => action.id), ['twitter-tail', 'reddit-tail'])
+      assert.equal(fixture.state.phase, terminal === 'failed' ? 0 : 2)
+      assert.equal(detailCount, 2, 'Final action logs must be read even if the earlier detail poll is incomplete')
+    } finally { initialDetail.resolve(); await fixture.close() }
+  })
 }
 
 test('a delayed report reply stays with its original conversation after selecting an agent', async () => {
