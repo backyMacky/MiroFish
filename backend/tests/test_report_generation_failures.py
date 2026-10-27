@@ -34,6 +34,7 @@ def test_outline_preserves_model_content_and_uses_bounded_english_instructions(a
     assert [s.title for s in result.sections] == ['Predicted outcome', 'Risks and uncertainty']
     call = agent.llm.chat_json.call_args.kwargs
     assert call['max_tokens'] == 1024
+    assert call['response_schema'] is reports.REPORT_OUTLINE_SCHEMA
     assert call['messages'][0]['content'].startswith('You write future-scenario reports')
     assert 'two to five' in call['messages'][0]['content']
     assert 'Keep this report brief.' in call['messages'][1]['content']

@@ -198,6 +198,7 @@ class LLMClient:
         temperature: float = 0.3,
         max_tokens: Optional[int] = 4096,
         max_attempts: int = 1,
+        response_schema: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Send chat request and return JSON
@@ -215,7 +216,12 @@ class LLMClient:
         if max_attempts < 1:
             raise ValueError("max_attempts must be at least 1")
 
-        response_format: Optional[Dict[str, str]] = {"type": "json_object"}
+        response_format: Optional[Dict[str, Any]] = {"type": "json_object"}
+        if response_schema is not None:
+            response_format = {
+                "type": "json_schema",
+                "json_schema": {"name": "structured_response", "strict": True, "schema": response_schema},
+            }
         request_max_tokens = max_tokens
         last_error: Optional[LLMResponseError] = None
 

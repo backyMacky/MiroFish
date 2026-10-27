@@ -41,6 +41,10 @@ def _report_token_budget(name: str, default: int) -> int:
     return value
 
 
+class ReportOutlineValidationError(ValueError):
+    """A controlled validation message containing no provider response text."""
+
+
 class ReportLogger:
     """
     Report Agent 详细日志记录器
@@ -588,9 +592,9 @@ PLAN_SYSTEM_PROMPT = """\
     "summary": "报告摘要（一句话概括核心预测发现）",
     "sections": [
         {
-            "title": "章节标题",
-            "description": "章节内容描述"
-        }
+            "title": "章节一标题"
+        },
+        {"title": "章节二标题"}
     ]
 }
 
@@ -627,7 +631,7 @@ invent people, actions, quotations or statistics. Honor the requested scope and
 brevity. Choose two to five concise sections, without subsections, based on the
 findings. Return only a JSON object with this structure:
 {"title":"Report title","summary":"One sentence summarizing the core findings",
- "sections":[{"title":"Section title","description":"One short sentence"}]}
+ "sections":[{"title":"First section title"},{"title":"Second section title"}]}
 The sections array must have at least two and at most five items. Keep the
 outline brief; section bodies will be generated separately."""
 
@@ -645,6 +649,24 @@ Sample facts retrieved from the simulated world:
 
 Design two to five sections that explain the conditional outcome, agent
 responses, emerging trends and risks. Follow the requested length and scope."""
+
+REPORT_OUTLINE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string", "minLength": 1, "maxLength": 160},
+        "summary": {"type": "string", "minLength": 1, "maxLength": 600},
+        "sections": {
+            "type": "array", "minItems": 2, "maxItems": 5,
+            "items": {
+                "type": "object",
+                "properties": {"title": {"type": "string", "minLength": 1, "maxLength": 160}},
+                "required": ["title"], "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["title", "summary", "sections"],
+    "additionalProperties": False,
+}
 
 # ── 章节生成 prompt ──
 
@@ -1264,6 +1286,7 @@ class ReportAgent:
                 ],
                 temperature=0.3,
                 max_tokens=self.plan_max_tokens,
+                response_schema=REPORT_OUTLINE_SCHEMA,
             )
             
             if progress_callback:
@@ -1272,19 +1295,19 @@ class ReportAgent:
             # Never turn an invalid or failed provider response into a default
             # outline that the UI can mistake for successful AI planning.
             if not isinstance(response, dict):
-                raise ValueError('Report outline must be a JSON object')
+                raise ReportOutlineValidationError('Report outline must be a JSON object')
             for field_name in ('title', 'summary'):
                 if not isinstance(response.get(field_name), str) or not response[field_name].strip():
-                    raise ValueError(f'Report outline requires a nonempty {field_name}')
+                    raise ReportOutlineValidationError(f'Report outline requires a nonempty {field_name}')
             supplied_sections = response.get('sections')
             if not isinstance(supplied_sections, list) or not 2 <= len(supplied_sections) <= 5:
-                raise ValueError('Report outline must contain two to five sections')
+                raise ReportOutlineValidationError('Report outline must contain two to five sections')
             sections = []
             for section_data in supplied_sections:
                 if (not isinstance(section_data, dict)
                         or not isinstance(section_data.get('title'), str)
                         or not section_data['title'].strip()):
-                    raise ValueError('Report section requires a nonempty title')
+                    raise ReportOutlineValidationError('Report section requires a nonempty title')
                 sections.append(ReportSection(
                     title=section_data['title'].strip(),
                     content=""
@@ -1303,10 +1326,11 @@ class ReportAgent:
             return outline
             
         except Exception as e:
-            logger.error('Report outline generation failed (%s)', type(e).__name__)
+            reason = str(e) if isinstance(e, ReportOutlineValidationError) else type(e).__name__
+            logger.error('Report outline generation failed (%s)', reason)
             # Exception bodies may contain provider credentials/request data.
             raise RuntimeError(
-                f'Report outline generation failed ({type(e).__name__}); '
+                f'Report outline generation failed ({reason}); '
                 'check provider availability, output format and request budget'
             ) from None
     

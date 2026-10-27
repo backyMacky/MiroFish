@@ -75,6 +75,22 @@ def test_chat_json_omits_token_cap_when_requested():
     assert "max_tokens" not in sequence.calls[0]
 
 
+def test_chat_json_can_request_a_schema_without_changing_other_callers_or_replaying():
+    schema = {"type": "object", "properties": {"ok": {"type": "boolean"}},
+              "required": ["ok"], "additionalProperties": False}
+    sequence = CompletionSequence(_response('{"ok": true}'))
+    client = _client_for(sequence)
+    result = client.chat_json(messages=[{"role": "user", "content": "Return JSON"}],
+                              max_tokens=768, response_schema=schema)
+    assert result == {"ok": True}
+    assert len(sequence.calls) == 1 and sequence.calls[0]['max_tokens'] == 768
+    assert sequence.calls[0]['response_format'] == {
+        "type": "json_schema", "json_schema": {
+            "name": "structured_response", "strict": True, "schema": schema,
+        },
+    }
+
+
 def test_chat_json_retries_empty_content_once():
     sequence = CompletionSequence(
         _response(None),

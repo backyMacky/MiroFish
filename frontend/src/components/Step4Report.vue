@@ -1838,6 +1838,10 @@ const workflowSteps = computed(() => {
     meta: completeStatus === 'active' ? 'FINALIZING' : ''
   })
 
+  if (isFailed.value) {
+    const failed = steps.find(step => step.status === 'active') || steps.find(step => step.status === 'todo') || steps[steps.length - 1]
+    return steps.map(step => step === failed ? { ...step, status: 'failed', meta: '' } : step)
+  }
   return steps
 })
 
@@ -2159,6 +2163,7 @@ watch(() => props.reportId, (newId) => {
 <style scoped>
 .report-failure { display: flex; gap: 12px; align-items: center; padding: 12px; color: #991b1b; background: #fff1f2; flex-shrink: 0; }
 .report-failure button { margin-left: auto; padding: 6px 12px; }
+.metric-pill.pill--failed, .wf-step--failed { color: #991b1b; background: #fff1f2; }
 .report-panel {
   height: 100%;
   display: flex;

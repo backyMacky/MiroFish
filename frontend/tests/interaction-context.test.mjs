@@ -249,6 +249,8 @@ test('failed reports stop generation indicators and retain logs for explicit ret
     assert.equal(state.activeSectionIndex, null)
     assert.equal(state.activeStep.status, 'failed')
     assert.equal(state.statusClass, 'failed')
+    assert.equal(state.workflowSteps.filter(step => step.status === 'active').length, 0)
+    assert.equal(state.workflowSteps.find(step => step.status === 'failed').key, 'planning')
     assert.equal(state.formatElapsedTime, '15m 1s')
     assert.equal(state.agentLogs.length, 3)
     assert.equal(fixture.requests.filter(r => r.method === 'post').length, 0)
