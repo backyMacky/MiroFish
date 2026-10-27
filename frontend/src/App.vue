@@ -44,4 +44,27 @@
 button {
   font-family: inherit;
 }
+
+/* The embedded workspace narrows when the host opens its import drawer. */
+@media (max-width: 1100px) {
+  .main-view .app-header {
+    height: auto;
+    min-height: 60px;
+    flex-shrink: 0;
+    flex-wrap: wrap;
+    gap: 12px;
+    padding: 12px 16px;
+  }
+
+  .main-view .app-header .header-center {
+    position: static;
+    transform: none;
+    margin-inline: auto;
+  }
+
+  .main-view .app-header .header-right {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+}
 </style>

@@ -4,6 +4,8 @@ OASIS模拟运行器
 """
 
 import os
+import re
+import math
 import sys
 import json
 import time
@@ -17,10 +19,12 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from queue import Queue
+from concurrent.futures import Future, TimeoutError as FutureTimeout
 
 from ..config import Config
 from ..utils.logger import get_logger
-from ..utils.locale import get_locale, set_locale
+from ..utils.locale import get_locale, set_locale, t
+from ..utils.simulation_values import normalize_config_hours
 from ..utils.zep import (
     ZEP_HTTP_REQUEST_TIMEOUT_SECONDS,
     ZEP_INGESTION_WAIT_TIMEOUT_SECONDS,
@@ -224,6 +228,26 @@ class SimulationRunner:
         '../../scripts'
     )
     
+    RUN_ARTIFACT_PATHS = (
+        'run_state.json', 'simulation.log', 'stdout.log', 'stderr.log',
+        'env_status.json', 'twitter/actions.jsonl', 'reddit/actions.jsonl',
+        'graph_memory_failure.json',
+        'ipc_commands', 'ipc_responses',
+        *(platform + '_simulation.db' + suffix
+          for platform in ('twitter', 'reddit') for suffix in ('', '-wal', '-shm')),
+    )
+
+    @classmethod
+    def has_run_artifacts(cls, simulation_id):
+        from pathlib import Path
+        if not isinstance(simulation_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]+', simulation_id):
+            raise ValueError('Invalid simulation identifier')
+        directory = Path(cls.RUN_STATE_DIR) / simulation_id
+        return any(
+            path.is_file() or (path.is_dir() and any(path.iterdir()))
+            for path in (directory / name for name in cls.RUN_ARTIFACT_PATHS)
+        )
+
     # 内存中的运行状态
     _run_states: Dict[str, SimulationRunState] = {}
     _processes: Dict[str, subprocess.Popen] = {}
@@ -237,6 +261,8 @@ class SimulationRunner:
     _finalization_locks: Dict[str, threading.Lock] = {}
     _finalization_locks_guard = threading.Lock()
     _manual_stop_requests: set[str] = set()
+    _stop_request_guard = threading.Lock()
+    _stop_requests: Dict[str, Future] = {}
 
     @classmethod
     def _finalization_lock(cls, simulation_id: str) -> threading.Lock:
@@ -362,8 +388,8 @@ class SimulationRunner:
         
         data = state.to_detail_dict()
         
-        with open(state_file, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        from ..utils.fileio import atomic_write_json
+        atomic_write_json(state_file, data)
         
         cls._run_states[state.simulation_id] = state
     
@@ -395,9 +421,12 @@ class SimulationRunner:
         
         if not os.path.exists(config_path):
             raise ValueError(f"模拟配置不存在，请先调用 /prepare 接口")
+
+        if cls.has_run_artifacts(simulation_id):
+            raise ValueError('Previous run data must be archived before starting a new simulation')
         
         with open(config_path, 'r', encoding='utf-8') as f:
-            config = json.load(f)
+            config = normalize_config_hours(json.load(f))
         
         # 初始化运行状态
         time_config = config.get("time_config", {})
@@ -524,15 +553,17 @@ class SimulationRunner:
             if max_rounds is not None and max_rounds > 0:
                 cmd.extend(["--max-rounds", str(max_rounds)])
             
-            # 创建主日志文件，避免 stdout/stderr 管道缓冲区满导致进程阻塞
-            main_log_path = os.path.join(sim_dir, "simulation.log")
-            main_log_file = open(main_log_path, 'w', encoding='utf-8')
+            # Keep subprocess output separate from SimulationLogManager's
+            # independently opened/truncated simulation.log file.
+            main_log_path = os.path.join(sim_dir, "stdout.log")
+            main_log_file = open(main_log_path, 'a', encoding='utf-8')
             
             # 设置子进程环境变量，确保 Windows 上使用 UTF-8 编码
             # 这可以修复第三方库（如 OASIS）读取文件时未指定编码的问题
             env = os.environ.copy()
             env['PYTHONUTF8'] = '1'  # Python 3.7+ 支持，让所有 open() 默认使用 UTF-8
             env['PYTHONIOENCODING'] = 'utf-8'  # 确保 stdout/stderr 使用 UTF-8
+            env['PYTHONUNBUFFERED'] = '1'
             
             # 设置工作目录为模拟目录（数据库等文件会生成在此）
             # 使用 start_new_session=True 创建新的进程组，确保可以通过 os.killpg 终止所有子进程
@@ -637,6 +668,7 @@ class SimulationRunner:
         
         monitor_error: Exception | None = None
         exit_code: int | None = None
+        loops_completed = False
         try:
             while process.poll() is None:  # 进程仍在运行
                 # 读取 Twitter 动作日志
@@ -651,6 +683,13 @@ class SimulationRunner:
                         reddit_actions_log, reddit_position, state, "reddit"
                     )
                 
+                # OASIS keeps its IPC environment alive for interviews after
+                # both producers finish. Waiting for process exit here would
+                # prevent the graph drain and reports from ever completing.
+                if (cls._check_all_platforms_completed(state)
+                        and simulation_id not in cls._manual_stop_requests):
+                    loops_completed = True
+                    break
                 # 更新状态
                 cls._save_run_state(state)
                 time.sleep(2)
@@ -661,7 +700,7 @@ class SimulationRunner:
             if os.path.exists(reddit_actions_log):
                 cls._read_action_log(reddit_actions_log, reddit_position, state, "reddit")
             
-            exit_code = process.returncode
+            exit_code = 0 if loops_completed else process.returncode
             
         except Exception as e:
             logger.error(f"监控线程异常: {simulation_id}, error={str(e)}")
@@ -693,6 +732,9 @@ class SimulationRunner:
                     elif not manual_stop and exit_code != 0:
                         desired_status = RunnerStatus.FAILED
                         main_log_path = os.path.join(sim_dir, "simulation.log")
+                        process_output = os.path.join(sim_dir, "stdout.log")
+                        if os.path.isfile(process_output):
+                            main_log_path = process_output
                         error_info = ""
                         try:
                             if os.path.exists(main_log_path):
@@ -727,7 +769,7 @@ class SimulationRunner:
                         except Exception as error:
                             logger.error(f"停止图谱记忆更新器失败: {error}")
                             desired_status = RunnerStatus.FAILED
-                            error_message = f"Zep图谱写入未完整完成: {error}"
+                            error_message = t('api.graphIngestionIncomplete', error=error)
 
                     state.runner_status = desired_status
                     state.error = error_message
@@ -744,24 +786,27 @@ class SimulationRunner:
                         logger.error(f"模拟失败: {simulation_id}, error={state.error}")
                 cls._manual_stop_requests.discard(simulation_id)
             
-            # 清理进程资源
-            cls._processes.pop(simulation_id, None)
-            cls._action_queues.pop(simulation_id, None)
             cls._monitor_threads.pop(simulation_id, None)
-            
-            # 关闭日志文件句柄
-            if simulation_id in cls._stdout_files:
-                try:
-                    cls._stdout_files[simulation_id].close()
-                except Exception:
-                    pass
-                cls._stdout_files.pop(simulation_id, None)
-            if simulation_id in cls._stderr_files and cls._stderr_files[simulation_id]:
-                try:
-                    cls._stderr_files[simulation_id].close()
-                except Exception:
-                    pass
-                cls._stderr_files.pop(simulation_id, None)
+            if loops_completed and process.poll() is None:
+                threading.Thread(target=cls._reap_environment, args=(simulation_id, process), daemon=True).start()
+            else:
+                cls._release_process_resources(simulation_id, process)
+
+    @classmethod
+    def _reap_environment(cls, simulation_id, process):
+        process.wait()
+        cls._release_process_resources(simulation_id, process)
+
+    @classmethod
+    def _release_process_resources(cls, simulation_id, process):
+        if cls._processes.get(simulation_id) is not process:
+            return
+        cls._processes.pop(simulation_id, None)
+        cls._action_queues.pop(simulation_id, None)
+        for streams in (cls._stdout_files, cls._stderr_files):
+            stream = streams.pop(simulation_id, None)
+            if stream:
+                stream.close()
     
     @classmethod
     def _read_action_log(
@@ -893,8 +938,8 @@ class SimulationRunner:
         reddit_log = os.path.join(sim_dir, "reddit", "actions.jsonl")
         
         # 检查哪些平台被启用（通过文件是否存在判断）
-        twitter_enabled = os.path.exists(twitter_log)
-        reddit_enabled = os.path.exists(reddit_log)
+        twitter_enabled = state.twitter_running or state.twitter_completed or os.path.exists(twitter_log)
+        reddit_enabled = state.reddit_running or state.reddit_completed or os.path.exists(reddit_log)
         
         # 如果平台被启用但未完成，则返回 False
         if twitter_enabled and not state.twitter_completed:
@@ -962,7 +1007,82 @@ class SimulationRunner:
                 process.wait(timeout=5)
     
     @classmethod
-    def stop_simulation(cls, simulation_id: str) -> SimulationRunState:
+    def request_stop(cls, simulation_id: str, *, wait_timeout: float = 1.0) -> SimulationRunState:
+        """Keep HTTP waits bounded, including contention on the drain lock.
+
+        The worker owns the stop even if the caller disconnects. Concurrent
+        requests share that worker; status polling never resubmits the stop.
+        """
+        if not isinstance(simulation_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]+', simulation_id):
+            raise ValueError('Invalid simulation identifier')
+        state = cls.get_run_state(simulation_id)
+        if state is None:
+            raise ValueError(f'Simulation not found: {simulation_id}')
+        if state.runner_status == RunnerStatus.STOPPED:
+            return state
+        locale = get_locale()
+        with cls._stop_request_guard:
+            future = cls._stop_requests.get(simulation_id)
+            if future is None:
+                future = Future()
+                cls._stop_requests[simulation_id] = future
+
+                def finish_stop():
+                    set_locale(locale)
+                    try:
+                        future.set_result(cls.stop_simulation(simulation_id))
+                    except Exception as error:
+                        future.set_exception(error)
+                    finally:
+                        with cls._stop_request_guard:
+                            if cls._stop_requests.get(simulation_id) is future:
+                                cls._stop_requests.pop(simulation_id, None)
+
+                try:
+                    threading.Thread(target=finish_stop, daemon=True,
+                                     name=f'stop-{simulation_id}').start()
+                except Exception:
+                    cls._stop_requests.pop(simulation_id, None)
+                    raise
+        try:
+            return future.result(timeout=max(0.0, wait_timeout))
+        except FutureTimeout as error:
+            if future.done():
+                # A worker may itself report a bounded finalization timeout.
+                return future.result()
+            raise SimulationStopPending('Stop accepted; graph finalization is still in progress') from error
+
+    @classmethod
+    def acknowledge_failed_restart(cls, simulation_id: str):
+        """Release terminal local ingestion after preserving the failed attempt."""
+        from pathlib import Path
+
+        lock = cls._finalization_lock(simulation_id)
+        if not lock.acquire(blocking=False):
+            raise SimulationStopPending('Previous run is still finalizing')
+        try:
+            state = cls.get_run_state(simulation_id)
+            if state is None or state.runner_status != RunnerStatus.FAILED:
+                raise RuntimeError('Only a failed run may acknowledge failed ingestion')
+            process = cls._processes.get(simulation_id)
+            monitor = cls._monitor_threads.get(simulation_id)
+            with cls._stop_request_guard:
+                stopping = simulation_id in cls._stop_requests
+            if (stopping or (process and process.poll() is None)
+                    or (monitor and monitor.is_alive())):
+                raise SimulationStopPending('Close the previous environment and wait for finalization before restarting')
+            ZepGraphMemoryManager.acknowledge_failed_local_updater(
+                simulation_id,
+                Path(cls.RUN_STATE_DIR) / simulation_id / 'graph_memory_failure.json',
+            )
+            cls._graph_memory_enabled.pop(simulation_id, None)
+            cls._manual_stop_requests.discard(simulation_id)
+            # Keep FAILED and its original diagnostic for the run archive.
+        finally:
+            lock.release()
+
+    @classmethod
+    def stop_simulation(cls, simulation_id: str, *, wait_timeout: float | None = None) -> SimulationRunState:
         """停止模拟"""
         with cls._finalization_lock(simulation_id):
             state = cls.get_run_state(simulation_id)
@@ -987,6 +1107,8 @@ class SimulationRunner:
                     RunnerStatus.STOPPING,
                 ]
                 and not retrying_finalization
+                and not (state.runner_status == RunnerStatus.COMPLETED
+                         and cls._processes.get(simulation_id) is not None)
             ):
                 raise ValueError(
                     f"模拟未在运行: {simulation_id}, status={state.runner_status}"
@@ -1023,7 +1145,7 @@ class SimulationRunner:
             and monitor is not threading.current_thread()
             and monitor.is_alive()
         ):
-            wait_timeout = max(
+            wait_timeout = wait_timeout if wait_timeout is not None else max(
                 30.0,
                 ZEP_INGESTION_WAIT_TIMEOUT_SECONDS
                 + ZEP_HTTP_REQUEST_TIMEOUT_SECONDS
@@ -1052,7 +1174,7 @@ class SimulationRunner:
                         state.twitter_running = False
                         state.reddit_running = False
                         state.completed_at = datetime.now().isoformat()
-                        state.error = f"Zep图谱写入未完整完成: {error}"
+                        state.error = t('api.graphIngestionIncomplete', error=error)
                         cls._save_run_state(state)
                         cls._sync_simulation_status(
                             simulation_id,
@@ -1081,6 +1203,8 @@ class SimulationRunner:
             )
 
         logger.info(f"模拟已停止: {simulation_id}")
+        if process is not None and process.poll() is not None:
+            cls._release_process_resources(simulation_id, process)
         return state
 
     @classmethod
@@ -1384,64 +1508,38 @@ class SimulationRunner:
         Returns:
             清理结果信息
         """
-        import shutil
-        
-        sim_dir = os.path.join(cls.RUN_STATE_DIR, simulation_id)
-        
-        if not os.path.exists(sim_dir):
-            return {"success": True, "message": "模拟目录不存在，无需清理"}
-        
-        cleaned_files = []
+        from pathlib import Path
+        import uuid
+
+        root = Path(cls.RUN_STATE_DIR).resolve()
+        directory = (root / simulation_id).resolve()
+        if directory.parent != root or not simulation_id or Path(simulation_id).name != simulation_id:
+            raise ValueError("Invalid simulation directory")
+        process = cls._processes.get(simulation_id)
+        if process is not None and process.poll() is None:
+            return {"success": False, "errors": ["Close the existing environment before restarting"]}
+        if not directory.exists():
+            return {"success": True, "cleaned_files": []}
+        archive = directory / 'run_attempts' / uuid.uuid4().hex
+        names = cls.RUN_ARTIFACT_PATHS
+        moved = []
         errors = []
-        
-        # 要删除的文件列表（包括数据库文件）
-        files_to_delete = [
-            "run_state.json",
-            "simulation.log",
-            "stdout.log",
-            "stderr.log",
-            "twitter_simulation.db",  # Twitter 平台数据库
-            "reddit_simulation.db",   # Reddit 平台数据库
-            "env_status.json",        # 环境状态文件
-        ]
-        
-        # 要删除的目录列表（包含动作日志）
-        dirs_to_clean = ["twitter", "reddit"]
-        
-        # 删除文件
-        for filename in files_to_delete:
-            file_path = os.path.join(sim_dir, filename)
-            if os.path.exists(file_path):
+        for name in names:
+            source = directory / name
+            if source.is_file() or source.is_dir():
                 try:
-                    os.remove(file_path)
-                    cleaned_files.append(filename)
-                except Exception as e:
-                    errors.append(f"删除 {filename} 失败: {str(e)}")
-        
-        # 清理平台目录中的动作日志
-        for dir_name in dirs_to_clean:
-            dir_path = os.path.join(sim_dir, dir_name)
-            if os.path.exists(dir_path):
-                actions_file = os.path.join(dir_path, "actions.jsonl")
-                if os.path.exists(actions_file):
-                    try:
-                        os.remove(actions_file)
-                        cleaned_files.append(f"{dir_name}/actions.jsonl")
-                    except Exception as e:
-                        errors.append(f"删除 {dir_name}/actions.jsonl 失败: {str(e)}")
-        
-        # 清理内存中的运行状态
-        if simulation_id in cls._run_states:
-            del cls._run_states[simulation_id]
-        
-        logger.info(f"清理模拟日志完成: {simulation_id}, 删除文件: {cleaned_files}")
-        
-        return {
-            "success": len(errors) == 0,
-            "cleaned_files": cleaned_files,
-            "errors": errors if errors else None
-        }
-    
+                    destination = archive / name
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(source, destination)
+                    moved.append(name)
+                except OSError:
+                    errors.append('Could not archive ' + name)
+        if not errors:
+            cls._run_states.pop(simulation_id, None)
+        return {"success": not errors, "cleaned_files": moved,
+                "archive_directory": str(archive) if moved else None,
+                "errors": errors or None}
+
     # 防止重复清理的标志
     _cleanup_done = False
     
@@ -1635,6 +1733,67 @@ class SimulationRunner:
         return running
     
     # ============== Interview 功能 ==============
+
+    @classmethod
+    def interview_command_client(cls, simulation_id):
+        if not isinstance(simulation_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]+', simulation_id):
+            raise ValueError('Invalid simulation identifier')
+        directory = os.path.join(cls.RUN_STATE_DIR, simulation_id)
+        if not os.path.isdir(directory):
+            raise ValueError('Simulation not found')
+        return SimulationIPCClient(directory)
+
+    @classmethod
+    def submit_interview_batch(cls, simulation_id, interviews, platform=None):
+        client = cls.interview_command_client(simulation_id)
+        if not client.check_env_alive():
+            raise ValueError('Simulation environment is not running')
+        args = {'interviews': interviews}
+        if platform:
+            args['platform'] = platform
+        timeout = float(os.getenv('INTERVIEW_COMMAND_TIMEOUT_SECONDS', '3600'))
+        if not math.isfinite(timeout) or not 1 <= timeout <= 7200:
+            raise ValueError('Interview command timeout must be from 1 to 7200 seconds')
+        detail = cls.get_env_status_detail(simulation_id)
+        active = [name for name in ('twitter', 'reddit') if detail.get(f'{name}_available')]
+        args['_expected_keys'] = [
+            f'{name}_{item["agent_id"]}' for item in interviews
+            for name in ([item.get('platform', platform)] if item.get('platform', platform) else active)
+        ]
+        args['_deadline_epoch'] = time.time() + timeout
+        command_id = client.submit_command(CommandType.BATCH_INTERVIEW, args)
+        return {'command_id': command_id, 'status': 'pending'}
+
+    @classmethod
+    def read_interview_command(cls, simulation_id, command_id):
+        client = cls.interview_command_client(simulation_id)
+        response = client.read_command(command_id)
+        receipt = client.read_request(command_id)
+        status = response['status']
+        if status in {'pending', 'processing'}:
+            if time.time() > receipt.args['_deadline_epoch']:
+                return {'status': 'failed', 'error': 'Interview deadline exceeded; command retained for review'}
+            if not client.check_env_alive():
+                return {'status': 'failed', 'error': 'Simulation environment closed before responding'}
+            return response
+        if status == 'failed':
+            return response
+        if status != 'completed' or not isinstance(response.get('result'), dict):
+            raise ValueError('Invalid interview response')
+        results = response['result'].get('results')
+        expected = set(receipt.args['_expected_keys'])
+        ids = {item['agent_id'] for item in receipt.args['interviews']}
+        if (not isinstance(results, dict) or not results
+                or any(not isinstance(row, dict) or type(row.get('agent_id')) is not int
+                       or not isinstance(row.get('response'), str)
+                       or not row['response'].strip() for row in results.values())
+                or {row.get('agent_id') for row in results.values()} != ids
+                or (expected and set(results) != expected)):
+            raise ValueError('Interview result is missing requested agent or platform responses')
+        return {
+            'command_id': command_id, 'status': 'completed',
+            'result': {'success': True, 'result': response['result'], 'timestamp': response['timestamp']},
+        }
     
     @classmethod
     def check_env_alive(cls, simulation_id: str) -> bool:

@@ -1,5 +1,10 @@
 <template>
   <div class="report-panel">
+    <div v-if="isFailed" class="report-failure" role="alert">
+      <strong>{{ $t('api.reportGenerateFailed') }}</strong>
+      <span>{{ failureMessage }}</span>
+      <button type="button" :disabled="isRetrying || !simulationId" @click="retryReport">{{ isRetrying ? $t('common.loading') : $t('common.retry') }}</button>
+    </div>
     <!-- Main Split Layout -->
     <div class="main-split-layout">
       <!-- LEFT PANEL: Report Style -->
@@ -67,12 +72,12 @@
 
         <!-- Waiting State -->
         <div v-if="!reportOutline" class="waiting-placeholder">
-          <div class="waiting-animation">
+          <div v-if="!isFailed" class="waiting-animation">
             <div class="waiting-ring"></div>
             <div class="waiting-ring"></div>
             <div class="waiting-ring"></div>
           </div>
-          <span class="waiting-text">Waiting for Report Agent...</span>
+          <span class="waiting-text">{{ isFailed ? $t('api.reportGenerateFailed') : 'Waiting for Report Agent...' }}</span>
         </div>
       </div>
 
@@ -393,7 +398,9 @@
 import { ref, computed, watch, onMounted, onUnmounted, nextTick, h, reactive } from 'vue'
 import { useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
-import { getAgentLog, getConsoleLog } from '../api/report'
+import { getAgentLog, getConsoleLog, generateReport } from '../api/report'
+import { startSerialPolling } from '../api/taskPolling'
+import { escapeHtml, renderMarkdown } from '../utils/markdown'
 
 const router = useRouter()
 const { t } = useI18n()
@@ -425,6 +432,11 @@ const expandedContent = ref(new Set())
 const expandedLogs = ref(new Set())
 const collapsedSections = ref(new Set())
 const isComplete = ref(false)
+const isFailed = ref(false)
+const failureMessage = ref('')
+const isRetrying = ref(false)
+const elapsedSeconds = ref(null)
+let pollGeneration = 0
 const startTime = ref(null)
 const leftPanel = ref(null)
 const rightPanel = ref(null)
@@ -1532,8 +1544,8 @@ const InterviewDisplay = {
                   h('div', {
                     class: ['qa-text', 'answer-text', { 'placeholder-text': isPlaceholder }],
                     innerHTML: isPlaceholder
-                      ? answerText
-                      : formatAnswer(answerText, isExpanded)
+                      ? escapeHtml(answerText)
+                      : escapeHtml(formatAnswer(answerText, isExpanded))
                           .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
                           .replace(/\n/g, '<br>')
                   }),
@@ -1707,12 +1719,14 @@ const QuickSearchDisplay = {
 
 // Computed
 const statusClass = computed(() => {
+  if (isFailed.value) return 'failed'
   if (isComplete.value) return 'completed'
   if (agentLogs.value.length > 0) return 'processing'
   return 'pending'
 })
 
 const statusText = computed(() => {
+  if (isFailed.value) return t('common.error')
   if (isComplete.value) return 'Completed'
   if (agentLogs.value.length > 0) return 'Generating...'
   return 'Waiting'
@@ -1736,12 +1750,11 @@ const totalToolCalls = computed(() => {
 })
 
 const formatElapsedTime = computed(() => {
-  if (!startTime.value) return '0s'
   const lastLog = agentLogs.value[agentLogs.value.length - 1]
-  const elapsed = lastLog?.elapsed_seconds || 0
+  const elapsed = Math.max(0, Math.round(elapsedSeconds.value ?? lastLog?.elapsed_seconds ?? 0))
   if (elapsed < 60) return `${Math.round(elapsed)}s`
   const mins = Math.floor(elapsed / 60)
-  const secs = Math.round(elapsed % 60)
+  const secs = elapsed % 60
   return `${mins}m ${secs}s`
 })
 
@@ -1751,7 +1764,7 @@ const displayLogs = computed(() => {
 
 // Workflow steps overview (status-based, no nested cards)
 const activeSectionIndex = computed(() => {
-  if (isComplete.value) return null
+  if (isComplete.value || isFailed.value) return null
   if (currentSectionIndex.value) return currentSectionIndex.value
   if (totalSections.value > 0 && completedSections.value < totalSections.value) return completedSections.value + 1
   return null
@@ -1766,11 +1779,12 @@ const isPlanningStarted = computed(() => {
 })
 
 const isFinalizing = computed(() => {
-  return !isComplete.value && isPlanningDone.value && totalSections.value > 0 && completedSections.value >= totalSections.value
+  return !isComplete.value && !isFailed.value && isPlanningDone.value && totalSections.value > 0 && completedSections.value >= totalSections.value
 })
 
 // 当前活跃的步骤（用于顶部显示）
 const activeStep = computed(() => {
+  if (isFailed.value) return { noLabel: '!', title: t('api.reportGenerateFailed'), status: 'failed', meta: '' }
   const steps = workflowSteps.value
   // 找到当前 active 的步骤
   const active = steps.find(s => s.status === 'active')
@@ -1824,6 +1838,10 @@ const workflowSteps = computed(() => {
     meta: completeStatus === 'active' ? 'FINALIZING' : ''
   })
 
+  if (isFailed.value) {
+    const failed = steps.find(step => step.status === 'active') || steps.find(step => step.status === 'todo') || steps[steps.length - 1]
+    return steps.map(step => step === failed ? { ...step, status: 'failed', meta: '' } : step)
+  }
   return steps
 })
 
@@ -1871,113 +1889,9 @@ const truncateText = (text, maxLen) => {
   return text.substring(0, maxLen) + '...'
 }
 
-const renderMarkdown = (content) => {
-  if (!content) return ''
-  
-  // 去掉开头的二级标题（## xxx），因为章节标题已在外层显示
-  let processedContent = content.replace(/^##\s+.+\n+/, '')
-  
-  // 处理代码块
-  let html = processedContent.replace(/```(\w*)\n([\s\S]*?)```/g, '<pre class="code-block"><code>$2</code></pre>')
-  
-  // 处理行内代码
-  html = html.replace(/`([^`]+)`/g, '<code class="inline-code">$1</code>')
-  
-  // 处理标题
-  html = html.replace(/^#### (.+)$/gm, '<h5 class="md-h5">$1</h5>')
-  html = html.replace(/^### (.+)$/gm, '<h4 class="md-h4">$1</h4>')
-  html = html.replace(/^## (.+)$/gm, '<h3 class="md-h3">$1</h3>')
-  html = html.replace(/^# (.+)$/gm, '<h2 class="md-h2">$1</h2>')
-  
-  // 处理引用块
-  html = html.replace(/^> (.+)$/gm, '<blockquote class="md-quote">$1</blockquote>')
-  
-  // 处理列表 - 支持子列表
-  html = html.replace(/^(\s*)- (.+)$/gm, (match, indent, text) => {
-    const level = Math.floor(indent.length / 2)
-    return `<li class="md-li" data-level="${level}">${text}</li>`
-  })
-  html = html.replace(/^(\s*)(\d+)\. (.+)$/gm, (match, indent, num, text) => {
-    const level = Math.floor(indent.length / 2)
-    return `<li class="md-oli" data-level="${level}">${text}</li>`
-  })
-
-  // 包装无序列表
-  html = html.replace(/(<li class="md-li"[^>]*>.*?<\/li>\s*)+/g, '<ul class="md-ul">$&</ul>')
-  // 包装有序列表
-  html = html.replace(/(<li class="md-oli"[^>]*>.*?<\/li>\s*)+/g, '<ol class="md-ol">$&</ol>')
-
-  // 清理列表项之间的所有空白
-  html = html.replace(/<\/li>\s+<li/g, '</li><li')
-  // 清理列表开始标签后的空白
-  html = html.replace(/<ul class="md-ul">\s+/g, '<ul class="md-ul">')
-  html = html.replace(/<ol class="md-ol">\s+/g, '<ol class="md-ol">')
-  // 清理列表结束标签前的空白
-  html = html.replace(/\s+<\/ul>/g, '</ul>')
-  html = html.replace(/\s+<\/ol>/g, '</ol>')
-  
-  // 处理粗体和斜体
-  html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-  html = html.replace(/\*(.+?)\*/g, '<em>$1</em>')
-  html = html.replace(/_(.+?)_/g, '<em>$1</em>')
-  
-  // 处理分隔线
-  html = html.replace(/^---$/gm, '<hr class="md-hr">')
-  
-  // 处理换行 - 空行变成段落分隔，单换行变成 <br>
-  html = html.replace(/\n\n/g, '</p><p class="md-p">')
-  html = html.replace(/\n/g, '<br>')
-  
-  // 包装在段落中
-  html = '<p class="md-p">' + html + '</p>'
-  
-  // 清理空段落
-  html = html.replace(/<p class="md-p"><\/p>/g, '')
-  html = html.replace(/<p class="md-p">(<h[2-5])/g, '$1')
-  html = html.replace(/(<\/h[2-5]>)<\/p>/g, '$1')
-  html = html.replace(/<p class="md-p">(<ul|<ol|<blockquote|<pre|<hr)/g, '$1')
-  html = html.replace(/(<\/ul>|<\/ol>|<\/blockquote>|<\/pre>)<\/p>/g, '$1')
-  // 清理块级元素前后的 <br> 标签
-  html = html.replace(/<br>\s*(<ul|<ol|<blockquote)/g, '$1')
-  html = html.replace(/(<\/ul>|<\/ol>|<\/blockquote>)\s*<br>/g, '$1')
-  // 清理 <p><br> 紧跟块级元素的情况（多余空行导致）
-  html = html.replace(/<p class="md-p">(<br>\s*)+(<ul|<ol|<blockquote|<pre|<hr)/g, '$2')
-  // 清理连续的 <br> 标签
-  html = html.replace(/(<br>\s*){2,}/g, '<br>')
-  // 清理块级元素后紧跟的段落开始标签前的 <br>
-  html = html.replace(/(<\/ol>|<\/ul>|<\/blockquote>)<br>(<p|<div)/g, '$1$2')
-
-  // 修复非连续有序列表的编号：当单项 <ol> 被段落内容隔开时，保持编号递增
-  const tokens = html.split(/(<ol class="md-ol">(?:<li class="md-oli"[^>]*>[\s\S]*?<\/li>)+<\/ol>)/g)
-  let olCounter = 0
-  let inSequence = false
-  for (let i = 0; i < tokens.length; i++) {
-    if (tokens[i].startsWith('<ol class="md-ol">')) {
-      const liCount = (tokens[i].match(/<li class="md-oli"/g) || []).length
-      if (liCount === 1) {
-        olCounter++
-        if (olCounter > 1) {
-          tokens[i] = tokens[i].replace('<ol class="md-ol">', `<ol class="md-ol" start="${olCounter}">`)
-        }
-        inSequence = true
-      } else {
-        olCounter = 0
-        inSequence = false
-      }
-    } else if (inSequence) {
-      if (/<h[2-5]/.test(tokens[i])) {
-        olCounter = 0
-        inSequence = false
-      }
-    }
-  }
-  html = tokens.join('')
-
-  return html
-}
 
 const getTimelineItemClass = (log, idx, total) => {
-  const isLatest = idx === total - 1 && !isComplete.value
+  const isLatest = idx === total - 1 && !isComplete.value && !isFailed.value
   const isMilestone = log.action === 'section_complete' || log.action === 'report_complete'
   return {
     'node--active': isLatest,
@@ -1988,7 +1902,7 @@ const getTimelineItemClass = (log, idx, total) => {
 }
 
 const getConnectorClass = (log, idx, total) => {
-  const isLatest = idx === total - 1 && !isComplete.value
+  const isLatest = idx === total - 1 && !isComplete.value && !isFailed.value
   if (isLatest) return 'dot-active'
   if (log.action === 'section_complete' || log.action === 'report_complete') return 'dot-done'
   return 'dot-muted'
@@ -2021,13 +1935,18 @@ const getLogLevelClass = (log) => {
 let agentLogTimer = null
 let consoleLogTimer = null
 
-const fetchAgentLog = async () => {
+const fetchAgentLog = async (signal) => {
   if (!props.reportId) return
+  const reportId = props.reportId
+  const generation = pollGeneration
   
   try {
-    const res = await getAgentLog(props.reportId, agentLogLine.value)
+    const res = await getAgentLog(reportId, agentLogLine.value, signal)
+    if (signal?.aborted || generation !== pollGeneration || props.reportId !== reportId) return
     
     if (res.success && res.data) {
+      if (Number.isFinite(res.data.elapsed_seconds)) elapsedSeconds.value = res.data.elapsed_seconds
+      const failedLog = (res.data.logs || []).find(log => log.stage === 'failed')
       const newLogs = res.data.logs || []
       
       if (newLogs.length > 0) {
@@ -2065,8 +1984,6 @@ const fetchAgentLog = async () => {
           }
         })
         
-        agentLogLine.value = res.data.from_line + newLogs.length
-        
         nextTick(() => {
           if (rightPanel.value) {
             // 如果任务已完成，滚动到顶部；否则滚动到底部跟随最新日志
@@ -2078,9 +1995,22 @@ const fetchAgentLog = async () => {
           }
         })
       }
+      agentLogLine.value = res.data.total_lines ?? (res.data.from_line ?? agentLogLine.value) + newLogs.length
+      if (res.data.status === 'failed' || failedLog) {
+        isFailed.value = true
+        currentSectionIndex.value = null
+        failureMessage.value = res.data.error || failedLog?.details?.error || t('api.reportGenerateFailed')
+        emit('update-status', 'error')
+        stopPolling()
+      } else if (res.data.status === 'completed' && !isComplete.value) {
+        isComplete.value = true
+        currentSectionIndex.value = null
+        emit('update-status', 'completed')
+        stopPolling()
+      }
     }
   } catch (err) {
-    console.warn('Failed to fetch agent log:', err)
+    if (!signal?.aborted) console.warn('Failed to fetch agent log', err?.response?.status)
   }
 }
 
@@ -2129,11 +2059,14 @@ const extractFinalContent = (response) => {
   return null
 }
 
-const fetchConsoleLog = async () => {
+const fetchConsoleLog = async (signal) => {
   if (!props.reportId) return
+  const reportId = props.reportId
+  const generation = pollGeneration
   
   try {
-    const res = await getConsoleLog(props.reportId, consoleLogLine.value)
+    const res = await getConsoleLog(reportId, consoleLogLine.value, signal)
+    if (signal?.aborted || generation !== pollGeneration || props.reportId !== reportId) return
     
     if (res.success && res.data) {
       const newLogs = res.data.logs || []
@@ -2150,28 +2083,43 @@ const fetchConsoleLog = async () => {
       }
     }
   } catch (err) {
-    console.warn('Failed to fetch console log:', err)
+    if (!signal?.aborted) console.warn('Failed to fetch console log', err?.response?.status)
   }
 }
 
 const startPolling = () => {
   if (agentLogTimer || consoleLogTimer) return
   
-  fetchAgentLog()
-  fetchConsoleLog()
-  
-  agentLogTimer = setInterval(fetchAgentLog, 2000)
-  consoleLogTimer = setInterval(fetchConsoleLog, 1500)
+  agentLogTimer = startSerialPolling(fetchAgentLog, { intervalMs: 2000 })
+  consoleLogTimer = startSerialPolling(fetchConsoleLog, { intervalMs: 1500 })
 }
 
 const stopPolling = () => {
+  pollGeneration += 1
   if (agentLogTimer) {
-    clearInterval(agentLogTimer)
+    agentLogTimer()
     agentLogTimer = null
   }
   if (consoleLogTimer) {
-    clearInterval(consoleLogTimer)
+    consoleLogTimer()
     consoleLogTimer = null
+  }
+}
+
+const retryReport = async () => {
+  if (isRetrying.value || !props.simulationId) return
+  const reportId = props.reportId
+  const generation = pollGeneration
+  isRetrying.value = true
+  try {
+    const result = await generateReport({ simulation_id: props.simulationId, force_regenerate: true })
+    if (generation !== pollGeneration || props.reportId !== reportId) return
+    if (!result.success || !result.data?.report_id) throw new Error(result.error || t('api.reportGenerateFailed'))
+    await router.push({ name: 'Report', params: { reportId: result.data.report_id } })
+  } catch (error) {
+    if (generation === pollGeneration && props.reportId === reportId) failureMessage.value = error.message
+  } finally {
+    if (generation === pollGeneration) isRetrying.value = false
   }
 }
 
@@ -2188,6 +2136,7 @@ onUnmounted(() => {
 })
 
 watch(() => props.reportId, (newId) => {
+  stopPolling()
   if (newId) {
     agentLogs.value = []
     consoleLogs.value = []
@@ -2200,6 +2149,10 @@ watch(() => props.reportId, (newId) => {
     expandedLogs.value = new Set()
     collapsedSections.value = new Set()
     isComplete.value = false
+    isFailed.value = false
+    failureMessage.value = ''
+    isRetrying.value = false
+    elapsedSeconds.value = null
     startTime.value = null
     
     startPolling()
@@ -2208,6 +2161,9 @@ watch(() => props.reportId, (newId) => {
 </script>
 
 <style scoped>
+.report-failure { display: flex; gap: 12px; align-items: center; padding: 12px; color: #991b1b; background: #fff1f2; flex-shrink: 0; }
+.report-failure button { margin-left: auto; padding: 6px 12px; }
+.metric-pill.pill--failed, .wf-step--failed { color: #991b1b; background: #fff1f2; }
 .report-panel {
   height: 100%;
   display: flex;

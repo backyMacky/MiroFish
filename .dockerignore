@@ -4,6 +4,13 @@
 .cursor
 .DS_Store
 .env
+.env.*
+!.env.example
+*.env
+*.log
+*.db
+*.db-wal
+*.db-shm
 
 node_modules
 frontend/node_modules
@@ -21,3 +28,4 @@ frontend/dist
 frontend/.vite
 
 backend/uploads
+backend/logs

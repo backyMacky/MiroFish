@@ -1,4 +1,5 @@
 import service from './index'
+import { readWithRetry, waitForTask } from './taskPolling'
 
 const DEFAULT_UPLOAD_CHUNK_BYTES = (() => {
   const parsed = Number(import.meta.env.VITE_ONTOLOGY_UPLOAD_CHUNK_BYTES)
@@ -46,15 +47,26 @@ const buildFileChunks = (files, maxChunkBytes) => {
  * @param {FormData} formData
  * @returns {Promise}
  */
-export function generateOntology(formData) {
+export function generateOntology(formData, signal) {
   return service({
     url: '/api/graph/ontology/generate',
     method: 'post',
+    signal,
     data: formData,
     headers: {
       'Content-Type': 'multipart/form-data'
     }
   })
+}
+
+export async function regenerateOntology(projectId, options = {}) {
+  const form = new FormData()
+  form.append('project_id', projectId)
+  form.append('async_ontology', 'true')
+  const response = await generateOntology(form, options.signal)
+  if (!response.data?.async_ontology) return response
+  options.onTaskStarted?.(response.data)
+  return waitForOntology(response.data.task_id, options)
 }
 
 /**
@@ -74,7 +86,10 @@ export async function generateOntologyChunked({
   projectName = '',
   additionalContext = '',
   maxChunkBytes = DEFAULT_UPLOAD_CHUNK_BYTES,
-  onChunkStart = null
+  onChunkStart = null,
+  onTaskStarted = null,
+  onProgress = null,
+  signal
 } = {}) {
   if (!Array.isArray(files) || files.length === 0) {
     throw new Error('No files selected for ontology generation')
@@ -125,14 +140,20 @@ export async function generateOntologyChunked({
       }
       if (deferOntology) {
         formData.append('defer_ontology', 'true')
+      } else {
+        formData.append('async_ontology', 'true')
       }
 
-      finalResponse = await generateOntology(formData)
+      finalResponse = await generateOntology(formData, signal)
       if (!finalResponse?.success) {
         throw new Error(finalResponse?.error || 'Ontology generation failed')
       }
 
       currentProjectId = finalResponse?.data?.project_id || currentProjectId
+      if (finalResponse?.data?.async_ontology) {
+        onTaskStarted?.(finalResponse.data)
+        finalResponse = await waitForOntology(finalResponse.data.task_id, { signal, onProgress })
+      }
       uploadedChunks += 1
     } catch (error) {
       const status = error?.response?.status
@@ -179,11 +200,16 @@ export function buildGraph(data) {
  * @param {String} taskId
  * @returns {Promise}
  */
-export function getTaskStatus(taskId) {
+export function getTaskStatus(taskId, signal) {
   return service({
     url: `/api/graph/task/${taskId}`,
-    method: 'get'
+    method: 'get',
+    signal
   })
+}
+
+export function waitForOntology(taskId, options) {
+  return waitForTask((signal) => getTaskStatus(taskId, signal), options)
 }
 
 /**
@@ -191,11 +217,12 @@ export function getTaskStatus(taskId) {
  * @param {String} graphId
  * @returns {Promise}
  */
-export function getGraphData(graphId) {
-  return service({
+export function getGraphData(graphId, signal) {
+  return readWithRetry((requestSignal) => service({
     url: `/api/graph/data/${graphId}`,
-    method: 'get'
-  })
+    method: 'get',
+    signal: requestSignal
+  }), { signal })
 }
 
 /**
@@ -203,9 +230,10 @@ export function getGraphData(graphId) {
  * @param {String} projectId
  * @returns {Promise}
  */
-export function getProject(projectId) {
-  return service({
+export function getProject(projectId, options) {
+  return readWithRetry((signal) => service({
     url: `/api/graph/project/${projectId}`,
-    method: 'get'
-  })
+    method: 'get',
+    signal
+  }), options)
 }

@@ -23,6 +23,7 @@ from ..utils.ontology import (
 )
 from ..utils.zep import (
     ZEP_INGESTION_WAIT_TIMEOUT_SECONDS,
+    ingestion_wait_timeout,
     call_zep_read_with_retry,
     get_zep_client,
     is_retryable_zep_error,
@@ -66,7 +67,7 @@ class GraphBuilderService:
     
     def __init__(self, api_key: Optional[str] = None):
         self.api_key = api_key or Config.ZEP_API_KEY
-        if not self.api_key:
+        if Config.GRAPH_BACKEND != "local" and not self.api_key:
             raise ValueError("ZEP_API_KEY 未配置")
         
         self.client = get_zep_client(self.api_key)
@@ -636,7 +637,7 @@ class GraphBuilderService:
     ) -> List[str]:
         """Wait for a Batch API terminal state and validate every item."""
 
-        timeout = timeout or ZEP_INGESTION_WAIT_TIMEOUT_SECONDS
+        timeout = timeout or ingestion_wait_timeout()
         start_time = time.time()
         terminal_states = {"succeeded", "partial", "failed", "invalid", "canceled"}
 

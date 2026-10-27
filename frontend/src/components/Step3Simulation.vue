@@ -91,6 +91,8 @@
       </div>
 
       <div class="action-controls">
+        <button v-if="['failed', 'stopped', 'completed'].includes(runStatus.runner_status)" class="action-btn" :disabled="isStarting || isGeneratingReport" @click="doStartSimulation(true)">{{ $t('common.restartSimulation') }}</button>
+        <button v-if="phase === 1" class="action-btn" :disabled="isStopping || runStatus.runner_status === 'stopping'" @click="handleStopSimulation">{{ $t('common.stop') }}</button>
         <button 
           class="action-btn primary"
           :disabled="phase !== 2 || isGeneratingReport"
@@ -101,6 +103,11 @@
           <span v-if="!isGeneratingReport" class="arrow-icon">→</span>
         </button>
       </div>
+    </div>
+
+    <div v-if="startError" role="alert" class="run-error">
+      <span>{{ startError }}</span>
+      <button type="button" :disabled="isStarting" @click="doStartSimulation()">{{ $t('common.retry') }}</button>
     </div>
 
     <!-- Main Content: Dual Timeline -->
@@ -296,6 +303,8 @@ import {
   getRunStatusDetail
 } from '../api/simulation'
 import { generateReport } from '../api/report'
+import { openSimulationSession } from '../api/simulationSession'
+import { startSerialPolling } from '../api/taskPolling'
 
 const { t } = useI18n()
 
@@ -380,7 +389,8 @@ const resetAllState = () => {
 }
 
 // 启动模拟
-const doStartSimulation = async () => {
+const doStartSimulation = async (restart = false) => {
+  if (isStarting.value) return
   if (!props.simulationId) {
     addLog(t('log.errorMissingSimId'))
     return
@@ -398,7 +408,7 @@ const doStartSimulation = async () => {
     const params = {
       simulation_id: props.simulationId,
       platform: 'parallel',
-      force: true,  // 强制重新开始
+      force: false,
       enable_graph_memory_update: true  // 开启动态图谱更新
     }
     
@@ -409,7 +419,9 @@ const doStartSimulation = async () => {
     
     addLog(t('log.graphMemoryUpdateEnabled'))
     
-    const res = await startSimulation(params)
+    const res = restart
+      ? await startSimulation({ ...params, force: true })
+      : await openSimulationSession(getRunStatus, startSimulation, params)
     
     if (res.success && res.data) {
       if (res.data.force_restarted) {
@@ -418,11 +430,21 @@ const doStartSimulation = async () => {
       addLog(t('log.engineStarted'))
       addLog(`  ├─ PID: ${res.data.process_pid || '-'}`)
       
-      phase.value = 1
       runStatus.value = res.data
-      
-      startStatusPolling()
-      startDetailPolling()
+      if (['completed', 'stopped'].includes(res.data.runner_status)) {
+        phase.value = 2
+        emit('update-status', 'completed')
+        await fetchRunStatusDetail()
+      } else if (res.data.runner_status === 'failed') {
+        phase.value = 0
+        startError.value = res.data.error || t('log.simFailed')
+        emit('update-status', 'error')
+        await fetchRunStatusDetail()
+      } else {
+        phase.value = 1
+        startStatusPolling()
+        startDetailPolling()
+      }
     } else {
       startError.value = res.error || '启动失败'
       addLog(t('log.startFailed', { error: res.error || t('common.unknownError') }))
@@ -448,14 +470,13 @@ const handleStopSimulation = async () => {
     const res = await stopSimulation({ simulation_id: props.simulationId })
     
     if (res.success) {
-      addLog(t('log.simStoppedSuccess'))
-      phase.value = 2
-      stopPolling()
-      emit('update-status', 'completed')
+      runStatus.value = res.data || runStatus.value
+      await fetchRunStatus()
     } else {
       addLog(t('log.stopFailed', { error: res.error || t('common.unknownError') }))
     }
   } catch (err) {
+    startError.value = err.message
     addLog(t('log.stopException', { error: err.message }))
   } finally {
     isStopping.value = false
@@ -467,20 +488,22 @@ let statusTimer = null
 let detailTimer = null
 
 const startStatusPolling = () => {
-  statusTimer = setInterval(fetchRunStatus, 2000)
+  statusTimer?.()
+  statusTimer = startSerialPolling(fetchRunStatus)
 }
 
 const startDetailPolling = () => {
-  detailTimer = setInterval(fetchRunStatusDetail, 3000)
+  detailTimer?.()
+  detailTimer = startSerialPolling(fetchRunStatusDetail, { intervalMs: 3000 })
 }
 
 const stopPolling = () => {
   if (statusTimer) {
-    clearInterval(statusTimer)
+    statusTimer()
     statusTimer = null
   }
   if (detailTimer) {
-    clearInterval(detailTimer)
+    detailTimer()
     detailTimer = null
   }
 }
@@ -489,16 +512,18 @@ const stopPolling = () => {
 const prevTwitterRound = ref(0)
 const prevRedditRound = ref(0)
 
-const fetchRunStatus = async () => {
+const fetchRunStatus = async (signal) => {
   if (!props.simulationId) return
   
   try {
-    const res = await getRunStatus(props.simulationId)
+    const res = await getRunStatus(props.simulationId, signal)
+    if (signal?.aborted) return
     
     if (res.success && res.data) {
       const data = res.data
       
       runStatus.value = data
+      startError.value = null
       
       // 分别检测各平台的轮次变化并输出日志
       if (data.twitter_current_round > prevTwitterRound.value) {
@@ -514,12 +539,20 @@ const fetchRunStatus = async () => {
       // 检测模拟是否已完成（通过 runner_status 或平台完成状态判断）
       const isCompleted = data.runner_status === 'completed' || data.runner_status === 'stopped'
       const isFailed = data.runner_status === 'failed'
+
+      // Read the final log tail before stopPolling aborts the independent
+      // detail request. Short runs can finish between its first two ticks.
+      if (isFailed || isCompleted) {
+        await fetchRunStatusDetail(signal)
+        if (signal?.aborted) return
+      }
       
       // runner_status is authoritative because the backend only publishes a
       // terminal state after the Zep ingestion barrier has completed.
       if (isFailed) {
         addLog(t('log.simFailed') + (data.error ? `: ${data.error}` : ''))
-        phase.value = 2
+        phase.value = 0
+        startError.value = data.error || t('log.simFailed')
         stopPolling()
         emit('update-status', 'error')
       } else if (isCompleted) {
@@ -530,6 +563,8 @@ const fetchRunStatus = async () => {
       }
     }
   } catch (err) {
+    if (signal?.aborted) return
+    startError.value = err.message
     console.warn('获取运行状态失败:', err)
   }
 }
@@ -558,11 +593,14 @@ const checkPlatformsCompleted = (data) => {
   return true
 }
 
-const fetchRunStatusDetail = async () => {
+const fetchRunStatusDetail = async (signal) => {
   if (!props.simulationId) return
+  const simulationId = props.simulationId
+  const currentActionIds = actionIds.value
   
   try {
-    const res = await getRunStatusDetail(props.simulationId)
+    const res = await getRunStatusDetail(simulationId, signal)
+    if (signal?.aborted || props.simulationId !== simulationId || actionIds.value !== currentActionIds) return
     
     if (res.success && res.data) {
       // 使用 all_actions 获取完整的动作列表
@@ -588,6 +626,7 @@ const fetchRunStatusDetail = async () => {
       // 新动作会在底部追加
     }
   } catch (err) {
+    if (signal?.aborted) return
     console.warn('获取详细状态失败:', err)
   }
 }
@@ -709,6 +748,9 @@ onUnmounted(() => {
   font-family: 'Space Grotesk', 'Noto Sans SC', system-ui, sans-serif;
   overflow: hidden;
 }
+
+.run-error { padding: 12px; color: #991b1b; background: #fff1f2; }
+.run-error button { margin-left: 12px; padding: 6px 12px; }
 
 /* --- Control Bar --- */
 .control-bar {

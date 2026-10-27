@@ -6,6 +6,7 @@ Supports Ollama num_ctx parameter to prevent prompt truncation
 
 import json
 import logging
+import math
 import os
 import re
 from typing import Optional, Dict, Any, List
@@ -98,7 +99,7 @@ class LLMClient:
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         model: Optional[str] = None,
-        timeout: float = 300.0
+        timeout: Optional[float] = None
     ):
         self.api_key = api_key or Config.LLM_API_KEY
         self.base_url = base_url or Config.LLM_BASE_URL
@@ -107,10 +108,16 @@ class LLMClient:
         if not self.api_key:
             raise ValueError("LLM_API_KEY not configured")
 
+        request_timeout = timeout if timeout is not None else float(os.getenv("LLM_TIMEOUT_SECONDS", "300"))
+        if not math.isfinite(request_timeout) or request_timeout <= 0:
+            raise ValueError("LLM timeout must be a finite positive number of seconds")
         self.client = OpenAI(
             api_key=self.api_key,
             base_url=self.base_url,
-            timeout=timeout,
+            timeout=request_timeout,
+            # Surface the configured deadline once. Hidden SDK retries can
+            # multiply a slow model's work and keep failed tasks alive.
+            max_retries=0,
         )
 
         # Ollama context window size — prevents prompt truncation for the
@@ -162,7 +169,8 @@ class LLMClient:
         messages: List[Dict[str, str]],
         temperature: float = 0.7,
         max_tokens: Optional[int] = 4096,
-        response_format: Optional[Dict] = None
+        response_format: Optional[Dict] = None,
+        require_complete: bool = False,
     ) -> str:
         """
         Send chat request
@@ -172,6 +180,7 @@ class LLMClient:
             temperature: Temperature parameter
             max_tokens: Max token count
             response_format: Response format (e.g., JSON mode)
+            require_complete: Reject interrupted or truncated text without retrying.
 
         Returns:
             Model response text
@@ -182,6 +191,14 @@ class LLMClient:
             max_tokens=max_tokens,
             response_format=response_format,
         )
+        if require_complete:
+            choices = getattr(response, 'choices', None) or []
+            if not choices:
+                raise LLMResponseError('LLM returned no choices')
+            finish_reason = getattr(choices[0], 'finish_reason', None)
+            if finish_reason not in {None, 'stop'}:
+                raise LLMResponseError('LLM text generation did not finish completely',
+                                       finish_reason=finish_reason)
         content = extract_chat_completion_text(response)
         return _clean_chat_text(content)
 
@@ -191,6 +208,7 @@ class LLMClient:
         temperature: float = 0.3,
         max_tokens: Optional[int] = 4096,
         max_attempts: int = 1,
+        response_schema: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Send chat request and return JSON
@@ -208,7 +226,12 @@ class LLMClient:
         if max_attempts < 1:
             raise ValueError("max_attempts must be at least 1")
 
-        response_format: Optional[Dict[str, str]] = {"type": "json_object"}
+        response_format: Optional[Dict[str, Any]] = {"type": "json_object"}
+        if response_schema is not None:
+            response_format = {
+                "type": "json_schema",
+                "json_schema": {"name": "structured_response", "strict": True, "schema": response_schema},
+            }
         request_max_tokens = max_tokens
         last_error: Optional[LLMResponseError] = None
 

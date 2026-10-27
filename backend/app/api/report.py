@@ -95,7 +95,7 @@ def generate_report():
             return jsonify({
                 "success": False,
                 "error": (
-                    "Simulation or Zep graph ingestion is still active; "
+                    "Simulation or graph ingestion is still active; "
                     "wait for a terminal run status before generating a report"
                 ),
                 "ingestion_pending": updater is not None,
@@ -190,7 +190,7 @@ def generate_report():
                 return jsonify({
                     "success": False,
                     "error": (
-                        "Simulation or Zep graph ingestion became active; "
+                        "Simulation or graph ingestion became active; "
                         "retry after it reaches a terminal state"
                     ),
                     "ingestion_pending": refreshed_updater is not None,

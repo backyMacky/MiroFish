@@ -1,13 +1,11 @@
 import axios from 'axios'
 import i18n from '../i18n'
+import { apiRoot } from './urls'
 
 // 创建axios实例
-// Default to a RELATIVE base ('/api') so the app works behind any mount point —
-// local dev ('/'), nginx prod ('/p/mirofish/'), or custom BASE_URL.
-// Vite exposes BASE_URL from vite.config's `base` option; concatenating 'api/'
-// yields `/api/` for local dev and `/p/mirofish/api/` in prod.
+// API modules already include /api/. Prefix only the plugin mount directory.
 const service = axios.create({
-  baseURL: import.meta.env.VITE_API_BASE_URL || (import.meta.env.BASE_URL + 'api').replace(/\/+api$/, '/api'),
+  baseURL: apiRoot(import.meta.env.VITE_API_BASE_URL, import.meta.env.BASE_URL),
   timeout: 300000, // 5分钟超时（本体生成可能需要较长时间）
   headers: {
     'Content-Type': 'application/json'
@@ -21,7 +19,7 @@ service.interceptors.request.use(
     return config
   },
   error => {
-    console.error('Request error:', error)
+    if (!axios.isCancel(error)) console.error('Request failed', { code: error.code })
     return Promise.reject(error)
   }
 )
@@ -33,14 +31,16 @@ service.interceptors.response.use(
     
     // 如果返回的状态码不是success，则抛出错误
     if (!res.success && res.success !== undefined) {
-      console.error('API Error:', res.error || res.message || 'Unknown error')
+      console.error('API reported failure')
       return Promise.reject(new Error(res.error || res.message || 'Error'))
     }
     
     return res
   },
   error => {
-    console.error('Response error:', error)
+    if (axios.isCancel(error)) return Promise.reject(error)
+    // Axios errors contain headers, request payloads and provider response bodies.
+    console.error('API request failed', { code: error.code, status: error.response?.status })
     const apiError = error.response?.data?.error || error.response?.data?.message
     
     // 处理超时

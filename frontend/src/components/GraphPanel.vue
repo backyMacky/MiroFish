@@ -4,7 +4,7 @@
       <span class="panel-title">{{ $t('graph.panelTitle') }}</span>
       <!-- 顶部工具栏 (Internal Top Right) -->
       <div class="header-tools">
-        <button class="tool-btn" @click="$emit('refresh')" :disabled="loading" :title="$t('graph.refreshGraph')">
+        <button class="tool-btn" @click="$emit('refresh')" :disabled="loading || !canRefresh" :title="$t('graph.refreshGraph')">
           <span class="icon-refresh" :class="{ 'spinning': loading }">↻</span>
           <span class="btn-text">Refresh</span>
         </button>
@@ -209,7 +209,7 @@
       <!-- 等待/空状态 -->
       <div v-else class="graph-state">
         <div class="empty-icon">❖</div>
-        <p class="empty-text">{{ $t('graph.waitingOntology') }}</p>
+          <p class="empty-text">{{ currentPhase === 0 ? $t('graph.waitingOntology') : $t('common.noData') }}</p>
       </div>
     </div>
 
@@ -225,23 +225,27 @@
     </div>
     
     <!-- 显示边标签开关 -->
-    <div v-if="graphData" class="edge-labels-toggle">
-      <label class="toggle-switch">
+    <label v-if="graphData" class="edge-labels-toggle">
+      <span class="toggle-switch">
         <input type="checkbox" v-model="showEdgeLabels" />
-        <span class="slider"></span>
-      </label>
-      <span class="toggle-label">Show Edge Labels</span>
-    </div>
+        <span class="slider" aria-hidden="true"></span>
+      </span>
+      <span class="toggle-label">{{ $t('graph.showEdgeLabels') }}</span>
+    </label>
   </div>
 </template>
 
 <script setup>
 import { ref, onMounted, onUnmounted, watch, nextTick, computed } from 'vue'
 import * as d3 from 'd3'
+import { useI18n } from 'vue-i18n'
+
+const { t } = useI18n({ useScope: 'global' })
 
 const props = defineProps({
   graphData: Object,
   loading: Boolean,
+  canRefresh: { type: Boolean, default: true },
   currentPhase: Number,
   isSimulating: Boolean
 })
@@ -650,11 +654,34 @@ const renderGraph = () => {
   // Nodes group
   const nodeGroup = g.append('g').attr('class', 'nodes')
   
+  const inspectNode = (event, d) => {
+  event.stopPropagation()
+  // 重置所有节点样式
+  node.attr('stroke', '#fff').attr('stroke-width', 2.5)
+  linkGroup.selectAll('path').attr('stroke', '#C0C0C0').attr('stroke-width', 1.5)
+  // 高亮选中节点
+  node.filter(item => item.id === d.id).attr('stroke', '#E91E63').attr('stroke-width', 4)
+  // 高亮与此节点相连的边
+  link.filter(l => l.source.id === d.id || l.target.id === d.id)
+    .attr('stroke', '#E91E63')
+    .attr('stroke-width', 2.5)
+
+  selectedItem.value = {
+    type: 'node',
+    data: d.rawData,
+    entityType: d.type,
+    color: getColor(d.type)
+  }
+  }
+
   // Node circles
   const node = nodeGroup.selectAll('circle')
     .data(nodes)
     .enter().append('circle')
     .attr('r', 10)
+    .attr('role', 'button')
+    .attr('tabindex', 0)
+    .attr('aria-label', d => t('graph.inspectNode', { name: d.name }))
     .attr('fill', d => getColor(d.type))
     .attr('stroke', '#fff')
     .attr('stroke-width', 2.5)
@@ -695,23 +722,11 @@ const renderGraph = () => {
         d._isDragging = false
       })
     )
-    .on('click', (event, d) => {
-      event.stopPropagation()
-      // 重置所有节点样式
-      node.attr('stroke', '#fff').attr('stroke-width', 2.5)
-      linkGroup.selectAll('path').attr('stroke', '#C0C0C0').attr('stroke-width', 1.5)
-      // 高亮选中节点
-      d3.select(event.target).attr('stroke', '#E91E63').attr('stroke-width', 4)
-      // 高亮与此节点相连的边
-      link.filter(l => l.source.id === d.id || l.target.id === d.id)
-        .attr('stroke', '#E91E63')
-        .attr('stroke-width', 2.5)
-      
-      selectedItem.value = {
-        type: 'node',
-        data: d.rawData,
-        entityType: d.type,
-        color: getColor(d.type)
+    .on('click', inspectNode)
+    .on('keydown', (event, d) => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault()
+        inspectNode(event, d)
       }
     })
     .on('mouseenter', (event, d) => {
@@ -735,7 +750,9 @@ const renderGraph = () => {
     .attr('font-weight', '500')
     .attr('dx', 14)
     .attr('dy', 4)
-    .style('pointer-events', 'none')
+    .style('pointer-events', 'all')
+    .style('cursor', 'pointer')
+    .on('click', inspectNode)
     .style('font-family', 'system-ui, sans-serif')
 
   simulation.on('tick', () => {
@@ -797,16 +814,27 @@ watch(showEdgeLabels, (newVal) => {
   }
 })
 
+let resizeTimer = null
+let resizeObserver = null
 const handleResize = () => {
-  nextTick(renderGraph)
+  clearTimeout(resizeTimer)
+  resizeTimer = setTimeout(() => {
+    if (graphContainer.value?.clientWidth > 0) nextTick(renderGraph)
+  }, 100)
 }
 
 onMounted(() => {
   window.addEventListener('resize', handleResize)
+  if (typeof ResizeObserver !== 'undefined' && graphContainer.value) {
+    resizeObserver = new ResizeObserver(handleResize)
+    resizeObserver.observe(graphContainer.value)
+  }
 })
 
 onUnmounted(() => {
   window.removeEventListener('resize', handleResize)
+  resizeObserver?.disconnect()
+  clearTimeout(resizeTimer)
   if (currentSimulation) {
     currentSimulation.stop()
   }
@@ -984,9 +1012,19 @@ onUnmounted(() => {
 }
 
 .toggle-switch input {
+  position: absolute;
+  inset: 0;
   opacity: 0;
-  width: 0;
-  height: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  z-index: 1;
+  cursor: pointer;
+}
+
+.toggle-switch input:focus-visible + .slider {
+  outline: 2px solid #884499;
+  outline-offset: 3px;
 }
 
 .slider {

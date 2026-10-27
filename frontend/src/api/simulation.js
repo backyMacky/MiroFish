@@ -1,4 +1,5 @@
 import service from './index'
+import { waitForTask } from './taskPolling'
 
 /**
  * 创建模拟
@@ -47,9 +48,9 @@ export const getSimulationProfiles = (simulationId, platform) => {
  * @param {string} simulationId
  * @param {string} [platform] - 'reddit' | 'twitter'（省略时由后端根据模拟配置自动选择）
  */
-export const getSimulationProfilesRealtime = (simulationId, platform) => {
+export const getSimulationProfilesRealtime = (simulationId, platform, signal) => {
   const params = platform ? { platform } : {}
-  return service.get(`/api/simulation/${simulationId}/profiles/realtime`, { params })
+  return service.get(`/api/simulation/${simulationId}/profiles/realtime`, { params, signal })
 }
 
 /**
@@ -65,8 +66,8 @@ export const getSimulationConfig = (simulationId) => {
  * @param {string} simulationId
  * @returns {Promise} 返回配置信息，包含元数据和配置内容
  */
-export const getSimulationConfigRealtime = (simulationId) => {
-  return service.get(`/api/simulation/${simulationId}/config/realtime`)
+export const getSimulationConfigRealtime = (simulationId, signal) => {
+  return service.get(`/api/simulation/${simulationId}/config/realtime`, { signal })
 }
 
 /**
@@ -98,16 +99,16 @@ export const stopSimulation = (data) => {
  * 获取模拟运行实时状态
  * @param {string} simulationId
  */
-export const getRunStatus = (simulationId) => {
-  return service.get(`/api/simulation/${simulationId}/run-status`)
+export const getRunStatus = (simulationId, signal) => {
+  return service.get(`/api/simulation/${simulationId}/run-status`, { signal })
 }
 
 /**
  * 获取模拟运行详细状态（包含最近动作）
  * @param {string} simulationId
  */
-export const getRunStatusDetail = (simulationId) => {
-  return service.get(`/api/simulation/${simulationId}/run-status/detail`)
+export const getRunStatusDetail = (simulationId, signal) => {
+  return service.get(`/api/simulation/${simulationId}/run-status/detail`, { signal })
 }
 
 /**
@@ -174,8 +175,14 @@ export const getEnvStatus = (data) => {
  * 批量采访 Agent
  * @param {Object} data - { simulation_id, interviews: [{ agent_id, prompt }] }
  */
-export const interviewAgents = (data) => {
-  return service.post('/api/simulation/interview/batch', data)
+export const interviewAgents = async (data, signal) => {
+  const response = await service.post('/api/simulation/interview/batch', { ...data, async: true }, { signal })
+  const commandId = response?.data?.command_id
+  if (!response?.success || !commandId) throw new Error('Interview command was not accepted')
+  return waitForTask(
+    signal => service.get(`/api/simulation/interview/status/${encodeURIComponent(data.simulation_id)}/${encodeURIComponent(commandId)}`, { signal }),
+    { signal },
+  )
 }
 
 /**

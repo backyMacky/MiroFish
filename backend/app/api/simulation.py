@@ -4,8 +4,10 @@ Step2: Zep实体读取与过滤、OASIS模拟准备与运行（全程自动化�
 """
 
 import os
+import threading
 import traceback
 from contextlib import nullcontext
+from functools import wraps
 from flask import request, jsonify, send_file
 
 from . import simulation_bp
@@ -20,11 +22,34 @@ from ..services.simulation_runner import (
 )
 from ..services.zep_graph_memory_updater import ZepGraphMemoryManager
 from ..utils.logger import get_logger
+from ..utils.simulation_values import normalize_config_hours
 from ..utils.locale import t, get_locale, set_locale
 from ..utils.zep_lifecycle import get_graph_readers, graph_lifecycle_lock
 from ..models.project import ProjectManager
 
 logger = get_logger('mirofish.api.simulation')
+_prepare_locks = tuple(threading.Lock() for _ in range(32))
+_start_locks = {}
+_start_locks_guard = threading.Lock()
+
+
+def _serialize_simulation_start(function):
+    """Keep explicit restart's check/archive/launch atomic for this simulation."""
+    @wraps(function)
+    def guarded():
+        identifier = (request.get_json(silent=True) or {}).get('simulation_id')
+        if not isinstance(identifier, str) or not identifier:
+            return function()
+        with _start_locks_guard:
+            lock = _start_locks.setdefault(identifier, threading.Lock())
+        if not lock.acquire(blocking=False):
+            return jsonify({'success': False, 'pending': True,
+                            'error': 'Another start or restart is in progress'}), 409
+        try:
+            return function()
+        finally:
+            lock.release()
+    return guarded
 
 
 def _get_default_platform(simulation_id: str) -> str:
@@ -87,7 +112,7 @@ def get_graph_entities(graph_id: str):
         enrich: 是否获取相关边信息（默认true）
     """
     try:
-        if not Config.ZEP_API_KEY:
+        if Config.GRAPH_BACKEND != "local" and not Config.ZEP_API_KEY:
             return jsonify({
                 "success": False,
                 "error": t('api.zepApiKeyMissing')
@@ -124,7 +149,7 @@ def get_graph_entities(graph_id: str):
 def get_entity_detail(graph_id: str, entity_uuid: str):
     """获取单个实体的详细信息"""
     try:
-        if not Config.ZEP_API_KEY:
+        if Config.GRAPH_BACKEND != "local" and not Config.ZEP_API_KEY:
             return jsonify({
                 "success": False,
                 "error": t('api.zepApiKeyMissing')
@@ -157,7 +182,7 @@ def get_entity_detail(graph_id: str, entity_uuid: str):
 def get_entities_by_type(graph_id: str, entity_type: str):
     """获取指定类型的所有实体"""
     try:
-        if not Config.ZEP_API_KEY:
+        if Config.GRAPH_BACKEND != "local" and not Config.ZEP_API_KEY:
             return jsonify({
                 "success": False,
                 "error": t('api.zepApiKeyMissing')
@@ -338,7 +363,7 @@ def _check_simulation_prepared(simulation_id: str) -> tuple:
         # - completed: 运行完成，说明准备早就完成了
         # - stopped: 已停止，说明准备早就完成了
         # - failed: 运行失败（但准备是完成的）
-        prepared_statuses = ["ready", "preparing", "running", "completed", "stopped", "failed"]
+        prepared_statuses = ["ready", "preparing", "running", "stopping", "completed", "stopped", "failed"]
         if status in prepared_statuses and config_generated:
             # 获取文件统计信息
             profiles_file = os.path.join(simulation_dir, "reddit_profiles.json")
@@ -356,8 +381,8 @@ def _check_simulation_prepared(simulation_id: str) -> tuple:
                     state_data["status"] = "ready"
                     from datetime import datetime
                     state_data["updated_at"] = datetime.now().isoformat()
-                    with open(state_file, 'w', encoding='utf-8') as f:
-                        json.dump(state_data, f, ensure_ascii=False, indent=2)
+                    from ..utils.fileio import atomic_write_json
+                    atomic_write_json(state_file, state_data)
                     logger.info(f"自动更新模拟状态: {simulation_id} preparing -> ready")
                     status = "ready"
                 except Exception as e:
@@ -388,6 +413,20 @@ def _check_simulation_prepared(simulation_id: str) -> tuple:
 
 @simulation_bp.route('/prepare', methods=['POST'])
 def prepare_simulation():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or not isinstance(data.get('simulation_id'), str) or not data['simulation_id']:
+        return jsonify({"success": False, "error": t('api.requireSimulationId')}), 400
+    for key in ('force_regenerate', 'use_llm_for_profiles'):
+        if key in data and not isinstance(data[key], bool):
+            return jsonify({"success": False, "error": f"{key} must be a boolean"}), 400
+    count = data.get('parallel_profile_count', 5)
+    if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= 32:
+        return jsonify({"success": False, "error": "parallel_profile_count must be an integer from 1 to 32"}), 400
+    with _prepare_locks[hash(data['simulation_id']) % len(_prepare_locks)]:
+        return _prepare_simulation_impl()
+
+
+def _prepare_simulation_impl():
     """
     准备模拟环境（异步任务，LLM智能生成所有参数）
     
@@ -450,6 +489,25 @@ def prepare_simulation():
                 "success": False,
                 "error": t('api.simulationNotFound', id=simulation_id)
             }), 404
+
+        if (state.status in {SimulationStatus.RUNNING, SimulationStatus.STOPPING}
+                and data.get('force_regenerate', False)):
+            return jsonify({"success": False, "error": "Stop the running simulation before preparing it again"}), 409
+
+        # Reuse the active job even when a client asks to regenerate. A second
+        # worker would overwrite the same profiles and configuration files.
+        task_manager = TaskManager()
+        for active in task_manager.list_tasks(task_type="simulation_prepare"):
+            if (active['metadata'].get('simulation_id') == simulation_id
+                    and active['status'] in ('pending', 'processing')):
+                return jsonify({"success": True, "data": {
+                    "simulation_id": simulation_id,
+                    "task_id": active['task_id'],
+                    "status": "preparing",
+                    "already_prepared": False,
+                    "expected_entities_count": state.entities_count,
+                    "entity_types": state.entity_types,
+                }})
         
         # 检查是否强制重新生成
         force_regenerate = data.get('force_regenerate', False)
@@ -475,6 +533,11 @@ def prepare_simulation():
             else:
                 logger.info(f"模拟 {simulation_id} 未准备完成，将启动准备任务")
         
+        # A setup visit may read confirmed preparation while a run is active.
+        # Missing preparation still cannot start a competing writer.
+        if state.status in {SimulationStatus.RUNNING, SimulationStatus.STOPPING}:
+            return jsonify({"success": False, "error": "Stop the running simulation before preparing it again"}), 409
+
         # 从项目获取必要信息
         project = ProjectManager.get_project(state.project_id)
         if not project:
@@ -644,7 +707,14 @@ def prepare_simulation():
         
         # 启动后台线程
         thread = threading.Thread(target=run_prepare, daemon=True)
-        thread.start()
+        try:
+            thread.start()
+        except Exception:
+            task_manager.fail_task(task_id, "Preparation worker could not start")
+            state.status = SimulationStatus.FAILED
+            state.error = "Preparation worker could not start"
+            manager._save_simulation_state(state)
+            raise
         
         return jsonify({
             "success": True,
@@ -984,6 +1054,8 @@ def get_simulation_history():
             
             # 获取关联项目的文件列表（最多3个）
             project = ProjectManager.get_project(sim.project_id)
+            if project and not sim_dict["simulation_requirement"]:
+                sim_dict["simulation_requirement"] = project.simulation_requirement or ""
             if project and hasattr(project, 'files') and project.files:
                 sim_dict["files"] = [
                     {"filename": f.get("filename", "未知文件")} 
@@ -1231,6 +1303,12 @@ def get_simulation_config_realtime(simulation_id: str):
             except (json.JSONDecodeError, Exception) as e:
                 logger.warning(f"读取 config 文件失败（可能正在写入中）: {e}")
                 config = None
+
+        if config is not None:
+            try:
+                config = normalize_config_hours(config)
+            except ValueError as error:
+                return jsonify({'success': False, 'error': str(error)}), 422
         
         # 检查是否正在生成（通过 state.json 判断）
         is_generating = False
@@ -1332,6 +1410,8 @@ def get_simulation_config(simulation_id: str):
             "data": config
         })
         
+    except ValueError as error:
+        return jsonify({'success': False, 'error': str(error)}), 422
     except Exception as e:
         logger.error(f"获取配置失败: {str(e)}")
         return jsonify({
@@ -1499,6 +1579,7 @@ def generate_profiles():
 # ============== 模拟运行控制接口 ==============
 
 @simulation_bp.route('/start', methods=['POST'])
+@_serialize_simulation_start
 def start_simulation():
     """
     开始运行模拟
@@ -1596,9 +1677,16 @@ def start_simulation():
             }), 404
 
         force_restarted = False
+
+        previous_run = SimulationRunner.has_run_artifacts(simulation_id)
+        if previous_run and not force:
+            return jsonify({
+                'success': False,
+                'error': 'Previous run data exists. Use Restart to archive it before starting a new run.',
+            }), 409
         
         # 智能处理状态：如果准备工作已完成，允许重新启动
-        if state.status != SimulationStatus.READY:
+        if state.status != SimulationStatus.READY or (force and previous_run):
             # 检查准备工作是否已完成
             is_prepared, prepare_info = _check_simulation_prepared(simulation_id)
 
@@ -1612,6 +1700,7 @@ def start_simulation():
                         RunnerStatus.PAUSED,
                         RunnerStatus.STOPPING,
                         RunnerStatus.FAILED,
+                        RunnerStatus.COMPLETED,
                     }
                     and (
                         run_state.runner_status
@@ -1621,6 +1710,8 @@ def start_simulation():
                             RunnerStatus.STOPPING,
                         }
                         or updater is not None
+                        or (SimulationRunner._processes.get(simulation_id) is not None
+                            and SimulationRunner._processes[simulation_id].poll() is None)
                     )
                 )
                 if needs_finalization:
@@ -1631,7 +1722,11 @@ def start_simulation():
                         }), 400
                     logger.info(f"强制模式：先完成旧模拟终止 {simulation_id}")
                     try:
-                        stopped = SimulationRunner.stop_simulation(simulation_id)
+                        if run_state.runner_status == RunnerStatus.FAILED:
+                            SimulationRunner.acknowledge_failed_restart(simulation_id)
+                            stopped = run_state
+                        else:
+                            stopped = SimulationRunner.request_stop(simulation_id)
                     except SimulationStopPending as error:
                         return jsonify({
                             "success": False,
@@ -1646,7 +1741,7 @@ def start_simulation():
                                 f"finalizes safely: {error}"
                             ),
                         }), 409
-                    if stopped.runner_status != RunnerStatus.STOPPED:
+                    if stopped.runner_status not in {RunnerStatus.STOPPED, RunnerStatus.FAILED}:
                         return jsonify({
                             "success": False,
                             "error": "Previous simulation did not reach STOPPED",
@@ -1686,6 +1781,11 @@ def start_simulation():
             project = ProjectManager.get_project(state.project_id)
             graph_id = project.graph_id if project else None
             if not graph_id:
+                if state.graph_id:
+                    return jsonify({
+                        'success': False,
+                        'error': 'The project graph was reset or deleted; refresh and prepare the simulation again.',
+                    }), 409
                 return jsonify({
                     "success": False,
                     "error": t('api.graphIdRequiredForMemory')
@@ -1815,7 +1915,7 @@ def stop_simulation():
                 "error": t('api.requireSimulationId')
             }), 400
         
-        run_state = SimulationRunner.stop_simulation(simulation_id)
+        run_state = SimulationRunner.request_stop(simulation_id, wait_timeout=1.0)
         
         # 更新模拟状态
         manager = SimulationManager()
@@ -1832,9 +1932,10 @@ def stop_simulation():
 
     except SimulationStopPending as e:
         return jsonify({
-            "success": False,
+            "success": True,
             "pending": True,
-            "error": str(e),
+            "message": str(e),
+            "data": {"simulation_id": simulation_id, "runner_status": "stopping"},
         }), 202
 
     except ValueError as e:
@@ -2494,6 +2595,8 @@ def interview_agents_batch():
                 "error": t('api.requireInterviews')
             }), 400
 
+        SimulationRunner.interview_command_client(simulation_id)
+
         # 验证platform参数
         if platform and platform not in ("twitter", "reddit"):
             return jsonify({
@@ -2503,6 +2606,8 @@ def interview_agents_batch():
 
         # 验证每个采访项
         for i, interview in enumerate(interviews):
+            if not isinstance(interview, dict):
+                return jsonify({'success': False, 'error': 'Interview entries must be objects'}), 400
             if 'agent_id' not in interview:
                 return jsonify({
                     "success": False,
@@ -2513,6 +2618,10 @@ def interview_agents_batch():
                     "success": False,
                     "error": t('api.interviewListMissingPrompt', index=i+1)
                 }), 400
+            if type(interview['agent_id']) is not int or interview['agent_id'] < 0:
+                return jsonify({'success': False, 'error': 'Agent identifiers must be nonnegative integers'}), 400
+            if not isinstance(interview['prompt'], str) or not interview['prompt'].strip():
+                return jsonify({'success': False, 'error': 'Interview prompts must be nonempty text'}), 400
             # 验证每项的platform（如果有）
             item_platform = interview.get('platform')
             if item_platform and item_platform not in ("twitter", "reddit"):
@@ -2534,6 +2643,11 @@ def interview_agents_batch():
             optimized_interview = interview.copy()
             optimized_interview['prompt'] = optimize_interview_prompt(interview.get('prompt', ''))
             optimized_interviews.append(optimized_interview)
+
+        if data.get('async') is True:
+            return jsonify({'success': True, 'data': SimulationRunner.submit_interview_batch(
+                simulation_id, optimized_interviews, platform,
+            )}), 202
 
         result = SimulationRunner.interview_agents_batch(
             simulation_id=simulation_id,
@@ -2566,6 +2680,14 @@ def interview_agents_batch():
             "error": str(e),
             "traceback": traceback.format_exc()
         }), 500
+
+
+@simulation_bp.route('/interview/status/<simulation_id>/<command_id>', methods=['GET'])
+def interview_command_status(simulation_id, command_id):
+    try:
+        return jsonify({'success': True, 'data': SimulationRunner.read_interview_command(simulation_id, command_id)})
+    except ValueError as error:
+        return jsonify({'success': False, 'error': str(error)}), 400
 
 
 @simulation_bp.route('/interview/all', methods=['POST'])
@@ -2851,12 +2973,8 @@ def close_simulation_env():
             timeout=timeout
         )
         
-        # 更新模拟状态
-        manager = SimulationManager()
-        state = manager.get_simulation(simulation_id)
-        if state:
-            state.status = SimulationStatus.COMPLETED
-            manager._save_simulation_state(state)
+        # Environment lifetime is independent of run completion. The runner's
+        # graph-ingestion barrier owns terminal status, including failures.
         
         return jsonify({
             "success": result.get("success", False),

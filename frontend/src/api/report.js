@@ -21,8 +21,8 @@ export const getReportStatus = (reportId) => {
  * @param {string} reportId
  * @param {number} fromLine - 从第几行开始获取
  */
-export const getAgentLog = (reportId, fromLine = 0) => {
-  return service.get(`/api/report/${reportId}/agent-log`, { params: { from_line: fromLine } })
+export const getAgentLog = (reportId, fromLine = 0, signal) => {
+  return service.get(`/api/report/${reportId}/agent-log`, { params: { from_line: fromLine }, signal })
 }
 
 /**
@@ -30,8 +30,8 @@ export const getAgentLog = (reportId, fromLine = 0) => {
  * @param {string} reportId
  * @param {number} fromLine - 从第几行开始获取
  */
-export const getConsoleLog = (reportId, fromLine = 0) => {
-  return service.get(`/api/report/${reportId}/console-log`, { params: { from_line: fromLine } })
+export const getConsoleLog = (reportId, fromLine = 0, signal) => {
+  return service.get(`/api/report/${reportId}/console-log`, { params: { from_line: fromLine }, signal })
 }
 
 /**

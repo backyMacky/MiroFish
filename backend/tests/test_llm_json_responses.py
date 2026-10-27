@@ -46,6 +46,28 @@ def _client_for(sequence):
     return client
 
 
+@pytest.mark.parametrize('reason', ['length', 'content_filter', 'tool_calls'])
+def test_complete_text_rejects_interruption_once_without_returning_partial_content(reason):
+    sequence = CompletionSequence(_response('private partial provider content', finish_reason=reason))
+    with pytest.raises(LLMResponseError, match='did not finish completely') as caught:
+        _client_for(sequence).chat(messages=[], max_tokens=384, require_complete=True)
+    assert caught.value.finish_reason == reason
+    assert 'private partial' not in str(caught.value)
+    assert len(sequence.calls) == 1
+
+
+def test_complete_text_preserves_finished_response():
+    sequence = CompletionSequence(_response('Final Answer: Owned evidence.'))
+    assert _client_for(sequence).chat(messages=[], require_complete=True) == 'Final Answer: Owned evidence.'
+    assert len(sequence.calls) == 1
+
+
+def test_complete_text_rejects_missing_choices():
+    sequence = CompletionSequence(_response('', include_choice=False))
+    with pytest.raises(LLMResponseError, match='no choices'):
+        _client_for(sequence).chat(messages=[], require_complete=True)
+
+
 def test_chat_json_retries_truncated_completion_without_token_cap():
     sequence = CompletionSequence(
         _response('{"items": [', finish_reason="length"),
@@ -73,6 +95,22 @@ def test_chat_json_omits_token_cap_when_requested():
         max_tokens=None,
     ) == {"ok": True}
     assert "max_tokens" not in sequence.calls[0]
+
+
+def test_chat_json_can_request_a_schema_without_changing_other_callers_or_replaying():
+    schema = {"type": "object", "properties": {"ok": {"type": "boolean"}},
+              "required": ["ok"], "additionalProperties": False}
+    sequence = CompletionSequence(_response('{"ok": true}'))
+    client = _client_for(sequence)
+    result = client.chat_json(messages=[{"role": "user", "content": "Return JSON"}],
+                              max_tokens=768, response_schema=schema)
+    assert result == {"ok": True}
+    assert len(sequence.calls) == 1 and sequence.calls[0]['max_tokens'] == 768
+    assert sequence.calls[0]['response_format'] == {
+        "type": "json_schema", "json_schema": {
+            "name": "structured_response", "strict": True, "schema": schema,
+        },
+    }
 
 
 def test_chat_json_retries_empty_content_once():

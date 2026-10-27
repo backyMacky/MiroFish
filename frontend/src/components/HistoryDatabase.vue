@@ -23,11 +23,15 @@
         v-for="(project, index) in projects" 
         :key="project.simulation_id"
         class="project-card"
+        role="button"
+        tabindex="0"
         :class="{ expanded: isExpanded, hovering: hoveringCard === index }"
         :style="getCardStyle(index)"
         @mouseenter="hoveringCard = index"
         @mouseleave="hoveringCard = null"
         @click="navigateToProject(project)"
+        @keydown.enter.prevent="navigateToProject(project)"
+        @keydown.space.prevent="navigateToProject(project)"
       >
         <!-- 卡片头部：simulation_id 和 功能可用状态 -->
         <div class="card-header">
@@ -683,10 +687,16 @@ onUnmounted(() => {
   transition: box-shadow 0.3s ease, border-color 0.3s ease, transform 700ms cubic-bezier(0.23, 1, 0.32, 1), opacity 700ms cubic-bezier(0.23, 1, 0.32, 1);
 }
 
-.project-card:hover {
+.project-card:hover,
+.project-card:focus-visible {
   box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
   border-color: rgba(0, 0, 0, 0.4);
   z-index: 1000 !important;
+}
+
+.project-card:focus-visible {
+  outline: 2px solid #2563EB;
+  outline-offset: 3px;
 }
 
 .project-card.hovering {

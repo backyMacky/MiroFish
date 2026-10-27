@@ -2,9 +2,28 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
+
+def test_local_ingestion_budget_does_not_change_cloud_policy(monkeypatch):
+    from app.utils import zep
+    monkeypatch.setenv('LOCAL_GRAPH_INGESTION_WAIT_TIMEOUT_SECONDS', '1800')
+    monkeypatch.setattr(zep.Config, 'GRAPH_BACKEND', 'local')
+    assert zep.ingestion_wait_timeout() == 1800
+    monkeypatch.setattr(zep.Config, 'GRAPH_BACKEND', 'zep_cloud')
+    assert zep.ingestion_wait_timeout() == 600
+    monkeypatch.setattr(zep.Config, 'GRAPH_BACKEND', 'local')
+    monkeypatch.setenv('LOCAL_GRAPH_INGESTION_WAIT_TIMEOUT_SECONDS', 'inf')
+    with pytest.raises(ValueError, match='1 to 7200'):
+        zep.ingestion_wait_timeout()
 from zep_cloud.core.api_error import ApiError as ZepApiError
 
 from app.utils import zep
+
+
+@pytest.fixture(autouse=True)
+def cloud_contract(monkeypatch):
+    # This module verifies the Cloud client regardless of local deployment mode.
+    monkeypatch.setattr(zep.Config, "GRAPH_BACKEND", "zep_cloud")
 
 
 def test_permanent_zep_errors_fail_without_retry():

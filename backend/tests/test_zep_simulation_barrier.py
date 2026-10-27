@@ -1,5 +1,9 @@
 from types import SimpleNamespace
+import threading
 import json
+import subprocess
+import sys
+import time
 
 import pytest
 from flask import Flask
@@ -15,7 +19,252 @@ from app.services.simulation_runner import (
 )
 
 
-def test_manual_stop_surfaces_graph_ingestion_failure(monkeypatch):
+@pytest.mark.parametrize('closed', [True, False])
+@pytest.mark.parametrize('status', [SimulationStatus.FAILED, SimulationStatus.STOPPING, SimulationStatus.COMPLETED])
+def test_close_environment_preserves_run_result(monkeypatch, closed, status):
+    state = SimpleNamespace(status=status, error='retained ingestion diagnostic')
+    saved = []
+    monkeypatch.setattr(
+        simulation_api, 'SimulationManager',
+        lambda: SimpleNamespace(
+            get_simulation=lambda _identifier: state,
+            _save_simulation_state=lambda value: saved.append(value.status),
+        ),
+    )
+    monkeypatch.setattr(
+        SimulationRunner, 'close_simulation_env',
+        classmethod(lambda _cls, simulation_id, **_kwargs: {'success': closed}),
+    )
+    app = Flask(__name__)
+    app.register_blueprint(simulation_api.simulation_bp, url_prefix='/simulation')
+    response = app.test_client().post('/simulation/close-env', json={'simulation_id': 'sim-close'})
+    assert response.status_code == 200
+    assert response.json['success'] is closed
+    assert state.status == status
+    assert state.error == 'retained ingestion diagnostic'
+    assert saved == []
+
+
+def test_finished_loops_drain_while_real_interview_process_stays_alive(monkeypatch, tmp_path):
+    """The process deliberately waits for IPC after its producer-end receipt."""
+    simulation_id = 'sim-live-environment'
+    directory = tmp_path / simulation_id / 'twitter'
+    directory.mkdir(parents=True)
+    (directory / 'actions.jsonl').write_text(
+        '{"event_type":"simulation_end","total_rounds":2,"total_actions":0}\n', encoding='utf-8',
+    )
+    monkeypatch.setattr(SimulationRunner, 'RUN_STATE_DIR', str(tmp_path))
+    monkeypatch.setattr(SimulationRunner, '_sync_simulation_status', classmethod(lambda *_a, **_k: None))
+    state = SimulationRunState(simulation_id=simulation_id, runner_status=RunnerStatus.RUNNING, twitter_running=True)
+    process = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+    SimulationRunner._processes[simulation_id] = process
+    SimulationRunner._run_states[simulation_id] = state
+    SimulationRunner._graph_memory_enabled[simulation_id] = True
+    drained = []
+    def drain(_cls, identifier):
+        assert identifier == simulation_id
+        assert process.poll() is None
+        assert state.runner_status == RunnerStatus.STOPPING
+        drained.append(True)
+    monkeypatch.setattr(runner_module.ZepGraphMemoryManager, 'stop_updater', classmethod(drain))
+    try:
+        SimulationRunner._monitor_simulation(simulation_id)
+        assert drained == [True]
+        assert process.poll() is None
+        assert state.runner_status == RunnerStatus.COMPLETED
+        assert SimulationRunner._processes[simulation_id] is process
+        saved = json.loads((tmp_path / simulation_id / 'run_state.json').read_text())
+        assert saved['runner_status'] == 'completed'
+    finally:
+        process.terminate()
+        process.wait(timeout=10)
+        for _ in range(100):
+            if simulation_id not in SimulationRunner._processes:
+                break
+            time.sleep(0.01)
+        SimulationRunner._processes.pop(simulation_id, None)
+        SimulationRunner._run_states.pop(simulation_id, None)
+        SimulationRunner._graph_memory_enabled.pop(simulation_id, None)
+
+
+def test_missing_second_platform_log_is_not_completion(monkeypatch, tmp_path):
+    monkeypatch.setattr(SimulationRunner, 'RUN_STATE_DIR', str(tmp_path))
+    directory = tmp_path / 'sim-dual' / 'twitter'
+    directory.mkdir(parents=True)
+    (directory / 'actions.jsonl').write_text('', encoding='utf-8')
+    state = SimulationRunState(simulation_id='sim-dual', twitter_completed=True, reddit_running=True)
+    assert not SimulationRunner._check_all_platforms_completed(state)
+
+
+def test_explicit_restart_archives_previous_run_without_touching_preparation(monkeypatch, tmp_path):
+    monkeypatch.setattr(SimulationRunner, 'RUN_STATE_DIR', str(tmp_path))
+    directory = tmp_path / 'sim-archive'
+    (directory / 'twitter').mkdir(parents=True)
+    (directory / 'run_state.json').write_text('{"runner_status":"completed"}')
+    (directory / 'twitter' / 'actions.jsonl').write_text('synthetic action\n')
+    (directory / 'simulation_config.json').write_text('synthetic configuration')
+    result = SimulationRunner.cleanup_simulation_logs('sim-archive')
+    assert result['success']
+    archive = __import__('pathlib').Path(result['archive_directory'])
+    assert (archive / 'twitter' / 'actions.jsonl').read_text() == 'synthetic action\n'
+    assert (directory / 'simulation_config.json').read_text() == 'synthetic configuration'
+    assert not (directory / 'run_state.json').exists()
+    with pytest.raises(ValueError, match='Invalid simulation directory'):
+        SimulationRunner.cleanup_simulation_logs('../outside')
+
+
+@pytest.mark.parametrize('force', [False, True])
+def test_ready_setup_cannot_bypass_prior_run_archive(monkeypatch, tmp_path, force):
+    simulation_id = 'sim-ready-restart'
+    directory = tmp_path / simulation_id
+    (directory / 'twitter').mkdir(parents=True)
+    originals = {
+        'twitter/actions.jsonl': b'old simulation_end event\n',
+        'twitter_simulation.db': b'old database',
+        'twitter_simulation.db-wal': b'old wal',
+        'run_state.json': b'{"runner_status":"completed"}',
+    }
+    for name, content in originals.items():
+        (directory / name).write_bytes(content)
+    config = directory / 'simulation_config.json'
+    config.write_bytes(b'prepared config retained verbatim')
+    monkeypatch.setattr(SimulationRunner, 'RUN_STATE_DIR', str(tmp_path))
+    state = SimpleNamespace(status=SimulationStatus.READY, project_id='proj-ready')
+    monkeypatch.setattr(simulation_api, 'SimulationManager', lambda: SimpleNamespace(
+        get_simulation=lambda _id: state, _save_simulation_state=lambda _state: None))
+    monkeypatch.setattr(simulation_api, '_check_simulation_prepared', lambda _id: (True, {}))
+    monkeypatch.setattr(SimulationRunner, 'get_run_state', classmethod(lambda *_args: None))
+    monkeypatch.setattr(runner_module.ZepGraphMemoryManager, 'get_updater', classmethod(lambda *_args: None))
+    launches = []
+
+    def launch(_cls, **kwargs):
+        assert not SimulationRunner.has_run_artifacts(simulation_id)
+        archives = list((directory / 'run_attempts').iterdir())
+        assert len(archives) == 1
+        for name, content in originals.items():
+            assert (archives[0] / name).read_bytes() == content
+        assert config.read_bytes() == b'prepared config retained verbatim'
+        launches.append(kwargs)
+        return SimulationRunState(simulation_id=simulation_id)
+
+    monkeypatch.setattr(SimulationRunner, 'start_simulation', classmethod(launch))
+    app = Flask(__name__)
+    app.register_blueprint(simulation_api.simulation_bp, url_prefix='/simulation')
+    response = app.test_client().post('/simulation/start', json={
+        'simulation_id': simulation_id, 'force': force, 'enable_graph_memory_update': False})
+    if force:
+        assert response.status_code == 200, response.json
+        assert response.json['data']['force_restarted'] is True
+        assert len(launches) == 1
+    else:
+        assert response.status_code == 409
+        assert launches == []
+        assert not (directory / 'run_attempts').exists()
+        for name, content in originals.items():
+            assert (directory / name).read_bytes() == content
+
+
+def test_runner_refuses_unarchived_events_before_launch(monkeypatch, tmp_path):
+    directory = tmp_path / 'sim-unarchived'
+    directory.mkdir()
+    (directory / 'simulation_config.json').write_text('{}')
+    (directory / 'run_state.json').write_text('{}')
+    monkeypatch.setattr(SimulationRunner, 'RUN_STATE_DIR', str(tmp_path))
+    with pytest.raises(ValueError, match='must be archived'):
+        SimulationRunner.start_simulation('sim-unarchived')
+
+
+@pytest.mark.parametrize('fails', [False, True])
+def test_real_subprocess_output_does_not_collide_with_structured_log(monkeypatch, tmp_path, fails):
+    import shutil
+    from pathlib import Path
+    simulation_id = 'sim-independent-output'
+    directory = tmp_path / simulation_id
+    directory.mkdir()
+    (directory / 'simulation_config.json').write_text('{"time_config":{"total_simulation_hours":1,"minutes_per_round":60}}')
+    scripts = tmp_path / 'scripts'
+    scripts.mkdir()
+    shutil.copyfile(Path(__file__).resolve().parents[1] / 'scripts' / 'action_logger.py', scripts / 'action_logger.py')
+    (scripts / 'run_twitter_simulation.py').write_text(
+        "import os\nfrom action_logger import SimulationLogManager\n"
+        "print('before structured logger')\n"
+        "log = SimulationLogManager(os.getcwd())\nlog.info('main marker')\n"
+        "print('IPC marker after structured logger')\n"
+        "assert os.environ['PYTHONUNBUFFERED'] == '1'\n"
+        + ("raise RuntimeError('owned process failure marker')\n" if fails else ''),
+        encoding='utf-8',
+    )
+    monkeypatch.setattr(SimulationRunner, 'RUN_STATE_DIR', str(tmp_path))
+    monkeypatch.setattr(SimulationRunner, 'SCRIPTS_DIR', str(scripts))
+    monitor = SimulationRunner._monitor_simulation
+    monkeypatch.setattr(SimulationRunner, '_monitor_simulation', classmethod(lambda *_args: None))
+    monkeypatch.setattr(SimulationRunner, '_sync_simulation_status', classmethod(lambda *_args: None))
+    process = None
+    try:
+        SimulationRunner.start_simulation(simulation_id, platform='twitter')
+        process = SimulationRunner._processes[simulation_id]
+        assert process.wait(timeout=10) == (1 if fails else 0)
+        output = (directory / 'stdout.log').read_text(encoding='utf-8')
+        assert 'before structured logger' in output
+        assert 'IPC marker after structured logger' in output
+        assert 'main marker' in (directory / 'simulation.log').read_text(encoding='utf-8')
+        monitor(simulation_id)
+        if fails:
+            state = SimulationRunner.get_run_state(simulation_id)
+            assert state.runner_status == RunnerStatus.FAILED
+            assert 'owned process failure marker' in state.error
+    finally:
+        if process is not None:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=5)
+            SimulationRunner._release_process_resources(simulation_id, process)
+        SimulationRunner._run_states.pop(simulation_id, None)
+        SimulationRunner._monitor_threads.pop(simulation_id, None)
+        SimulationRunner._graph_memory_enabled.pop(simulation_id, None)
+
+
+def test_stop_request_is_bounded_and_deduplicated_behind_real_drain_lock(monkeypatch, tmp_path):
+    simulation_id = 'sim-locked-stop'
+    state = SimulationRunState(simulation_id=simulation_id, runner_status=RunnerStatus.STOPPING)
+    monkeypatch.setattr(SimulationRunner, 'RUN_STATE_DIR', str(tmp_path))
+    monkeypatch.setattr(SimulationRunner, 'get_run_state', classmethod(lambda *_args: state))
+    monkeypatch.setattr(SimulationRunner, '_sync_simulation_status', classmethod(lambda *_args: None))
+    monkeypatch.setattr(runner_module.ZepGraphMemoryManager, 'get_updater', classmethod(lambda *_args: None))
+    lock = SimulationRunner._finalization_lock(simulation_id)
+    lock.acquire()
+    original_stop = SimulationRunner.stop_simulation
+    entered = threading.Event()
+    calls = []
+
+    def stop(_cls, identifier):
+        calls.append(identifier)
+        entered.set()
+        return original_stop(identifier)
+
+    monkeypatch.setattr(SimulationRunner, 'stop_simulation', classmethod(stop))
+    try:
+        start = time.monotonic()
+        with pytest.raises(SimulationStopPending):
+            SimulationRunner.request_stop(simulation_id, wait_timeout=0.02)
+        assert entered.wait(1)
+        with pytest.raises(SimulationStopPending):
+            SimulationRunner.request_stop(simulation_id, wait_timeout=0.02)
+        assert time.monotonic() - start < 1
+        assert calls == [simulation_id]
+        future = SimulationRunner._stop_requests[simulation_id]
+    finally:
+        lock.release()
+    try:
+        assert future.result(timeout=3).runner_status == RunnerStatus.STOPPED
+        assert SimulationRunner.request_stop(simulation_id).runner_status == RunnerStatus.STOPPED
+        assert calls == [simulation_id]
+    finally:
+        SimulationRunner._manual_stop_requests.discard(simulation_id)
+
+
+@pytest.mark.parametrize('locale, expected', [('en', 'Graph ingestion did not complete'), ('zh', '图谱写入未完整完成')])
+def test_manual_stop_surfaces_graph_ingestion_failure(monkeypatch, locale, expected):
     state = SimulationRunState(
         simulation_id="sim-1",
         runner_status=RunnerStatus.RUNNING,
@@ -43,14 +292,19 @@ def test_manual_stop_surfaces_graph_ingestion_failure(monkeypatch):
     SimulationRunner._processes.pop("sim-1", None)
     SimulationRunner._graph_memory_enabled["sim-1"] = True
 
+    previous_locale = runner_module.get_locale()
+    runner_module.set_locale(locale)
     try:
         with pytest.raises(RuntimeError, match="ingestion incomplete"):
             SimulationRunner.stop_simulation("sim-1")
 
         assert state.runner_status == RunnerStatus.FAILED
         assert "ingestion incomplete" in state.error
+        assert expected in state.error
+        assert 'Zep' not in state.error
         assert saved[-1] == RunnerStatus.FAILED
     finally:
+        runner_module.set_locale(previous_locale)
         SimulationRunner._graph_memory_enabled.pop("sim-1", None)
         SimulationRunner._manual_stop_requests.discard("sim-1")
 
@@ -158,9 +412,9 @@ def test_stop_api_keeps_pending_finalization_out_of_failed_state(monkeypatch):
     saved = []
     monkeypatch.setattr(
         simulation_api.SimulationRunner,
-        "stop_simulation",
+        "request_stop",
         classmethod(
-            lambda _cls, _simulation_id: (_ for _ in ()).throw(
+            lambda _cls, _simulation_id, **_kwargs: (_ for _ in ()).throw(
                 SimulationStopPending("still draining")
             )
         ),
@@ -237,7 +491,7 @@ def test_force_restart_does_not_continue_while_old_ingestion_is_pending(monkeypa
     )
     monkeypatch.setattr(
         simulation_api.SimulationRunner,
-        "stop_simulation",
+        "request_stop",
         classmethod(
             lambda _cls, _simulation_id: (_ for _ in ()).throw(
                 SimulationStopPending("still draining")

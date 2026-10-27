@@ -414,6 +414,7 @@
 import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { chatWithReport, getReport, getAgentLog } from '../api/report'
+import { renderMarkdown } from '../utils/markdown'
 import { interviewAgents, getSimulationProfilesRealtime } from '../api/simulation'
 
 const { t } = useI18n()
@@ -447,6 +448,20 @@ const selectedAgents = ref(new Set())
 const surveyQuestion = ref('')
 const surveyResults = ref([])
 const isSurveying = ref(false)
+let disposed = false
+let conversationEpoch = 0
+const interviewControllers = new Set()
+const chatKey = (target = chatTarget.value, index = selectedAgentIndex.value) =>
+  JSON.stringify([props.simulationId, props.reportId, target, target === 'agent' ? index : null])
+const requestInterviews = async (data) => {
+  const controller = new AbortController()
+  interviewControllers.add(controller)
+  try {
+    return await interviewAgents(data, controller.signal)
+  } finally {
+    interviewControllers.delete(controller)
+  }
+}
 
 // Report Data
 const reportOutline = ref(null)
@@ -490,12 +505,8 @@ const selectChatTarget = (target) => {
 // 保存当前对话记录到缓存
 const saveChatHistory = () => {
   if (chatHistory.value.length === 0) return
-  
-  if (chatTarget.value === 'report_agent') {
-    chatHistoryCache.value['report_agent'] = [...chatHistory.value]
-  } else if (selectedAgentIndex.value !== null) {
-    chatHistoryCache.value[`agent_${selectedAgentIndex.value}`] = [...chatHistory.value]
-  }
+  if (chatTarget.value === 'agent' && selectedAgentIndex.value === null) return
+  chatHistoryCache.value[chatKey()] = [...chatHistory.value]
 }
 
 const selectReportAgentChat = () => {
@@ -509,10 +520,11 @@ const selectReportAgentChat = () => {
   showAgentDropdown.value = false
   
   // 恢复 Report Agent 的对话记录
-  chatHistory.value = chatHistoryCache.value['report_agent'] || []
+  chatHistory.value = chatHistoryCache.value[chatKey('report_agent')] || []
 }
 
 const selectSurveyTab = () => {
+  saveChatHistory()
   activeTab.value = 'survey'
   selectedAgent.value = null
   selectedAgentIndex.value = null
@@ -521,10 +533,6 @@ const selectSurveyTab = () => {
 
 const toggleAgentDropdown = () => {
   showAgentDropdown.value = !showAgentDropdown.value
-  if (showAgentDropdown.value) {
-    activeTab.value = 'chat'
-    chatTarget.value = 'agent'
-  }
 }
 
 const selectAgent = (agent, idx) => {
@@ -533,11 +541,12 @@ const selectAgent = (agent, idx) => {
   
   selectedAgent.value = agent
   selectedAgentIndex.value = idx
+  activeTab.value = 'chat'
   chatTarget.value = 'agent'
   showAgentDropdown.value = false
   
   // 恢复该 Agent 的对话记录
-  chatHistory.value = chatHistoryCache.value[`agent_${idx}`] || []
+  chatHistory.value = chatHistoryCache.value[chatKey('agent', idx)] || []
   addLog(t('log.selectChatTarget', { name: agent.username }))
 }
 
@@ -554,96 +563,15 @@ const formatTime = (timestamp) => {
   }
 }
 
-const renderMarkdown = (content) => {
-  if (!content) return ''
-  
-  let processedContent = content.replace(/^##\s+.+\n+/, '')
-  let html = processedContent.replace(/```(\w*)\n([\s\S]*?)```/g, '<pre class="code-block"><code>$2</code></pre>')
-  html = html.replace(/`([^`]+)`/g, '<code class="inline-code">$1</code>')
-  html = html.replace(/^#### (.+)$/gm, '<h5 class="md-h5">$1</h5>')
-  html = html.replace(/^### (.+)$/gm, '<h4 class="md-h4">$1</h4>')
-  html = html.replace(/^## (.+)$/gm, '<h3 class="md-h3">$1</h3>')
-  html = html.replace(/^# (.+)$/gm, '<h2 class="md-h2">$1</h2>')
-  html = html.replace(/^> (.+)$/gm, '<blockquote class="md-quote">$1</blockquote>')
-  
-  // 处理列表 - 支持子列表
-  html = html.replace(/^(\s*)- (.+)$/gm, (match, indent, text) => {
-    const level = Math.floor(indent.length / 2)
-    return `<li class="md-li" data-level="${level}">${text}</li>`
-  })
-  html = html.replace(/^(\s*)(\d+)\. (.+)$/gm, (match, indent, num, text) => {
-    const level = Math.floor(indent.length / 2)
-    return `<li class="md-oli" data-level="${level}">${text}</li>`
-  })
-  
-  // 包装无序列表
-  html = html.replace(/(<li class="md-li"[^>]*>.*?<\/li>\s*)+/g, '<ul class="md-ul">$&</ul>')
-  // 包装有序列表
-  html = html.replace(/(<li class="md-oli"[^>]*>.*?<\/li>\s*)+/g, '<ol class="md-ol">$&</ol>')
-  
-  // 清理列表项之间的所有空白
-  html = html.replace(/<\/li>\s+<li/g, '</li><li')
-  // 清理列表开始标签后的空白
-  html = html.replace(/<ul class="md-ul">\s+/g, '<ul class="md-ul">')
-  html = html.replace(/<ol class="md-ol">\s+/g, '<ol class="md-ol">')
-  // 清理列表结束标签前的空白
-  html = html.replace(/\s+<\/ul>/g, '</ul>')
-  html = html.replace(/\s+<\/ol>/g, '</ol>')
-  
-  html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-  html = html.replace(/\*(.+?)\*/g, '<em>$1</em>')
-  html = html.replace(/_(.+?)_/g, '<em>$1</em>')
-  html = html.replace(/^---$/gm, '<hr class="md-hr">')
-  html = html.replace(/\n\n/g, '</p><p class="md-p">')
-  html = html.replace(/\n/g, '<br>')
-  html = '<p class="md-p">' + html + '</p>'
-  html = html.replace(/<p class="md-p"><\/p>/g, '')
-  html = html.replace(/<p class="md-p">(<h[2-5])/g, '$1')
-  html = html.replace(/(<\/h[2-5]>)<\/p>/g, '$1')
-  html = html.replace(/<p class="md-p">(<ul|<ol|<blockquote|<pre|<hr)/g, '$1')
-  html = html.replace(/(<\/ul>|<\/ol>|<\/blockquote>|<\/pre>)<\/p>/g, '$1')
-  // 清理块级元素前后的 <br> 标签
-  html = html.replace(/<br>\s*(<ul|<ol|<blockquote)/g, '$1')
-  html = html.replace(/(<\/ul>|<\/ol>|<\/blockquote>)\s*<br>/g, '$1')
-  // 清理 <p><br> 紧跟块级元素的情况（多余空行导致）
-  html = html.replace(/<p class="md-p">(<br>\s*)+(<ul|<ol|<blockquote|<pre|<hr)/g, '$2')
-  // 清理连续的 <br> 标签
-  html = html.replace(/(<br>\s*){2,}/g, '<br>')
-  // 清理块级元素后紧跟的段落开始标签前的 <br>
-  html = html.replace(/(<\/ol>|<\/ul>|<\/blockquote>)<br>(<p|<div)/g, '$1$2')
-
-  // 修复非连续有序列表的编号：当单项 <ol> 被段落内容隔开时，保持编号递增
-  const tokens = html.split(/(<ol class="md-ol">(?:<li class="md-oli"[^>]*>[\s\S]*?<\/li>)+<\/ol>)/g)
-  let olCounter = 0
-  let inSequence = false
-  for (let i = 0; i < tokens.length; i++) {
-    if (tokens[i].startsWith('<ol class="md-ol">')) {
-      const liCount = (tokens[i].match(/<li class="md-oli"/g) || []).length
-      if (liCount === 1) {
-        olCounter++
-        if (olCounter > 1) {
-          tokens[i] = tokens[i].replace('<ol class="md-ol">', `<ol class="md-ol" start="${olCounter}">`)
-        }
-        inSequence = true
-      } else {
-        olCounter = 0
-        inSequence = false
-      }
-    } else if (inSequence) {
-      if (/<h[2-5]/.test(tokens[i])) {
-        olCounter = 0
-        inSequence = false
-      }
-    }
-  }
-  html = tokens.join('')
-
-  return html
-}
 
 // Chat Methods
 const sendMessage = async () => {
   if (!chatInput.value.trim() || isSending.value) return
+  const context = {
+    key: chatKey(), epoch: conversationEpoch, history: chatHistory.value,
+    target: chatTarget.value, agent: selectedAgent.value, agentId: selectedAgentIndex.value,
+    simulationId: props.simulationId, reportId: props.reportId,
+  }
   
   const message = chatInput.value.trim()
   chatInput.value = ''
@@ -659,31 +587,36 @@ const sendMessage = async () => {
   isSending.value = true
   
   try {
-    if (chatTarget.value === 'report_agent') {
-      await sendToReportAgent(message)
+    if (context.target === 'report_agent') {
+      await sendToReportAgent(message, context)
     } else {
-      await sendToAgent(message)
+      await sendToAgent(message, context)
     }
   } catch (err) {
+    if (disposed || context.epoch !== conversationEpoch) return
     addLog(t('log.sendFailed', { error: err.message }))
-    chatHistory.value.push({
+    context.history.push({
       role: 'assistant',
       content: t('step5.errorOccurred', { error: err.message }),
       timestamp: new Date().toISOString()
     })
   } finally {
-    isSending.value = false
-    scrollToBottom()
-    // 自动保存对话记录到缓存
-    saveChatHistory()
+    if (!disposed && context.epoch === conversationEpoch) {
+      isSending.value = false
+      chatHistoryCache.value[context.key] = [...context.history]
+      if (chatKey() === context.key) {
+        chatHistory.value = [...context.history]
+        scrollToBottom()
+      }
+    }
   }
 }
 
-const sendToReportAgent = async (message) => {
+const sendToReportAgent = async (message, context) => {
   addLog(t('log.sendToReportAgent', { message: message.substring(0, 50) }))
   
   // Build chat history for API
-  const historyForApi = chatHistory.value
+  const historyForApi = context.history
     .slice(0, -1)
     .slice(-10) // Keep last 10 messages
     .map(msg => ({
@@ -692,13 +625,14 @@ const sendToReportAgent = async (message) => {
     }))
   
   const res = await chatWithReport({
-    simulation_id: props.simulationId,
+    simulation_id: context.simulationId,
     message: message,
     chat_history: historyForApi
   })
   
+  if (disposed || context.epoch !== conversationEpoch) return
   if (res.success && res.data) {
-    chatHistory.value.push({
+    context.history.push({
       role: 'assistant',
       content: res.data.response || res.data.answer || t('step5.noResponse'),
       timestamp: new Date().toISOString()
@@ -709,17 +643,17 @@ const sendToReportAgent = async (message) => {
   }
 }
 
-const sendToAgent = async (message) => {
-  if (!selectedAgent.value || selectedAgentIndex.value === null) {
+const sendToAgent = async (message, context) => {
+  if (!context.agent || context.agentId === null) {
     throw new Error(t('step5.selectAgentFirst'))
   }
   
-  addLog(t('log.sendToAgent', { name: selectedAgent.value.username, message: message.substring(0, 50) }))
+  addLog(t('log.sendToAgent', { name: context.agent.username, message: message.substring(0, 50) }))
   
   // Build prompt with chat history
   let prompt = message
-  if (chatHistory.value.length > 1) {
-    const historyContext = chatHistory.value
+  if (context.history.length > 1) {
+    const historyContext = context.history
       .slice(0, -1)
       .slice(-6)
       .map(msg => `${msg.role === 'user' ? '提问者' : '你'}：${msg.content}`)
@@ -727,14 +661,15 @@ const sendToAgent = async (message) => {
     prompt = `以下是我们之前的对话：\n${historyContext}\n\n现在我的新问题是：${message}`
   }
   
-  const res = await interviewAgents({
-    simulation_id: props.simulationId,
+  const res = await requestInterviews({
+    simulation_id: context.simulationId,
     interviews: [{
-      agent_id: selectedAgentIndex.value,
+      agent_id: context.agentId,
       prompt: prompt
     }]
   })
   
+  if (disposed || context.epoch !== conversationEpoch) return
   if (res.success && res.data) {
     // 正确的数据路径: res.data.result.results 是一个对象字典
     // 格式: {"twitter_0": {...}, "reddit_0": {...}} 或单平台 {"reddit_0": {...}}
@@ -743,28 +678,29 @@ const sendToAgent = async (message) => {
     
     // 将对象字典转换为数组，优先获取 reddit 平台的回复
     let responseContent = null
-    const agentId = selectedAgentIndex.value
+    const agentId = context.agentId
     
     if (typeof resultsDict === 'object' && !Array.isArray(resultsDict)) {
       // 优先使用 reddit 平台回复，其次 twitter
       const redditKey = `reddit_${agentId}`
       const twitterKey = `twitter_${agentId}`
-      const agentResult = resultsDict[redditKey] || resultsDict[twitterKey] || Object.values(resultsDict)[0]
+      const agentResult = resultsDict[redditKey] || resultsDict[twitterKey] || Object.values(resultsDict).find(row => row?.agent_id === agentId)
       if (agentResult) {
         responseContent = agentResult.response || agentResult.answer
       }
     } else if (Array.isArray(resultsDict) && resultsDict.length > 0) {
       // 兼容数组格式
-      responseContent = resultsDict[0].response || resultsDict[0].answer
+      const agentResult = resultsDict.find(row => row?.agent_id === agentId)
+      responseContent = agentResult?.response || agentResult?.answer
     }
     
     if (responseContent) {
-      chatHistory.value.push({
+      context.history.push({
         role: 'assistant',
         content: responseContent,
         timestamp: new Date().toISOString()
       })
-      addLog(t('log.agentReplied', { name: selectedAgent.value.username }))
+      addLog(t('log.agentReplied', { name: context.agent.username }))
     } else {
       throw new Error(t('step5.noResponse'))
     }
@@ -804,6 +740,10 @@ const clearAgentSelection = () => {
 
 const submitSurvey = async () => {
   if (selectedAgents.value.size === 0 || !surveyQuestion.value.trim()) return
+  const epoch = conversationEpoch
+  const question = surveyQuestion.value.trim()
+  const simulationId = props.simulationId
+  const agents = [...profiles.value]
   
   isSurveying.value = true
   addLog(t('log.sendSurvey', { count: selectedAgents.value.size }))
@@ -811,14 +751,15 @@ const submitSurvey = async () => {
   try {
     const interviews = Array.from(selectedAgents.value).map(idx => ({
       agent_id: idx,
-      prompt: surveyQuestion.value.trim()
+      prompt: question
     }))
     
-    const res = await interviewAgents({
-      simulation_id: props.simulationId,
+    const res = await requestInterviews({
+      simulation_id: simulationId,
       interviews: interviews
     })
     
+    if (disposed || epoch !== conversationEpoch) return
     if (res.success && res.data) {
       // 正确的数据路径: res.data.result.results 是一个对象字典
       // 格式: {"twitter_0": {...}, "reddit_0": {...}, "twitter_1": {...}, ...}
@@ -830,7 +771,7 @@ const submitSurvey = async () => {
       
       for (const interview of interviews) {
         const agentIdx = interview.agent_id
-        const agent = profiles.value[agentIdx]
+        const agent = agents[agentIdx]
         
         // 优先使用 reddit 平台回复，其次 twitter
         let responseContent = t('step5.noResponse')
@@ -854,7 +795,7 @@ const submitSurvey = async () => {
           agent_id: agentIdx,
           agent_name: agent?.username || `Agent ${agentIdx}`,
           profession: agent?.profession,
-          question: surveyQuestion.value.trim(),
+          question,
           answer: responseContent
         })
       }
@@ -865,35 +806,43 @@ const submitSurvey = async () => {
       throw new Error(res.error || t('step5.requestFailed'))
     }
   } catch (err) {
+    if (disposed || epoch !== conversationEpoch) return
     addLog(t('log.surveySendFailed', { error: err.message }))
   } finally {
-    isSurveying.value = false
+    if (!disposed && epoch === conversationEpoch) isSurveying.value = false
   }
 }
 
 // Load Report Data
 const loadReportData = async () => {
   if (!props.reportId) return
+  const epoch = conversationEpoch
+  const reportId = props.reportId
   
   try {
     addLog(t('log.loadReportData', { id: props.reportId }))
     
     // Get report info
-    const reportRes = await getReport(props.reportId)
+    const reportRes = await getReport(reportId)
+    if (disposed || epoch !== conversationEpoch) return
     if (reportRes.success && reportRes.data) {
       // Load agent logs to get report outline and sections
       await loadAgentLogs()
     }
   } catch (err) {
+    if (disposed || epoch !== conversationEpoch) return
     addLog(t('log.loadReportFailed', { error: err.message }))
   }
 }
 
 const loadAgentLogs = async () => {
   if (!props.reportId) return
+  const epoch = conversationEpoch
+  const reportId = props.reportId
   
   try {
-    const res = await getAgentLog(props.reportId, 0)
+    const res = await getAgentLog(reportId, 0)
+    if (disposed || epoch !== conversationEpoch) return
     if (res.success && res.data) {
       const logs = res.data.logs || []
       
@@ -910,20 +859,25 @@ const loadAgentLogs = async () => {
       addLog(t('log.reportDataLoaded'))
     }
   } catch (err) {
+    if (disposed || epoch !== conversationEpoch) return
     addLog(t('log.loadReportLogFailed', { error: err.message }))
   }
 }
 
 const loadProfiles = async () => {
   if (!props.simulationId) return
+  const epoch = conversationEpoch
+  const simulationId = props.simulationId
   
   try {
-    const res = await getSimulationProfilesRealtime(props.simulationId)
+    const res = await getSimulationProfilesRealtime(simulationId)
+    if (disposed || epoch !== conversationEpoch) return
     if (res.success && res.data) {
       profiles.value = res.data.profiles || []
       addLog(t('log.loadedProfiles', { count: profiles.value.length }))
     }
   } catch (err) {
+    if (disposed || epoch !== conversationEpoch) return
     addLog(t('log.loadProfilesFailed', { error: err.message }))
   }
 }
@@ -939,25 +893,37 @@ const handleClickOutside = (e) => {
 // Lifecycle
 onMounted(() => {
   addLog(t('log.step5Init'))
-  loadReportData()
-  loadProfiles()
   document.addEventListener('click', handleClickOutside)
 })
 
 onUnmounted(() => {
+  disposed = true
+  for (const controller of interviewControllers) controller.abort()
   document.removeEventListener('click', handleClickOutside)
 })
 
-watch(() => props.reportId, (newId) => {
-  if (newId) {
-    loadReportData()
-  }
-}, { immediate: true })
-
-watch(() => props.simulationId, (newId) => {
-  if (newId) {
-    loadProfiles()
-  }
+watch([() => props.simulationId, () => props.reportId], () => {
+  conversationEpoch++
+  for (const controller of interviewControllers) controller.abort()
+  interviewControllers.clear()
+  isSending.value = false
+  isSurveying.value = false
+  chatHistory.value = []
+  chatHistoryCache.value = {}
+  chatInput.value = ''
+  selectedAgent.value = null
+  selectedAgentIndex.value = null
+  chatTarget.value = 'report_agent'
+  showAgentDropdown.value = false
+  profiles.value = []
+  selectedAgents.value = new Set()
+  surveyQuestion.value = ''
+  surveyResults.value = []
+  reportOutline.value = null
+  generatedSections.value = {}
+  collapsedSections.value = new Set()
+  if (props.reportId) loadReportData()
+  if (props.simulationId) loadProfiles()
 }, { immediate: true })
 </script>
 
