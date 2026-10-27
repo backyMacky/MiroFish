@@ -21,7 +21,7 @@ from enum import Enum
 from ..config import Config
 from ..utils.llm_client import LLMClient
 from ..utils.logger import get_logger
-from ..utils.locale import get_language_instruction, t
+from ..utils.locale import get_language_instruction, get_locale, t
 from .zep_tools import (
     ZepToolsService, 
     SearchResult, 
@@ -31,6 +31,13 @@ from .zep_tools import (
 )
 
 logger = get_logger('mirofish.report_agent')
+
+
+def _report_token_budget(name: str, default: int) -> int:
+    value = int(os.getenv(name, str(default)))
+    if not 256 <= value <= 8192:
+        raise ValueError(f'{name} must be from 256 to 8192')
+    return value
 
 
 class ReportLogger:
@@ -610,6 +617,34 @@ PLAN_USER_PROMPT_TEMPLATE = """\
 
 【再次提醒】报告章节数量：最少2个，最多5个，内容要精炼聚焦于核心预测发现。"""
 
+PLAN_SYSTEM_PROMPT_EN = """You write future-scenario reports from a simulated world.
+Analyze what happened under the supplied scenario, how its agents responded, and
+the resulting trends and risks. These are conditional simulation predictions,
+not verified real-world outcomes or a generic overview of public opinion.
+Use the supplied evidence and preserve the participants' stated roles. Do not
+invent people, actions, quotations or statistics. Honor the requested scope and
+brevity. Choose two to five concise sections, without subsections, based on the
+findings. Return only a JSON object with this structure:
+{"title":"Report title","summary":"One sentence summarizing the core findings",
+ "sections":[{"title":"Section title","description":"One short sentence"}]}
+The sections array must have at least two and at most five items. Keep the
+outline brief; section bodies will be generated separately."""
+
+PLAN_USER_PROMPT_TEMPLATE_EN = """Scenario and requested report:
+{simulation_requirement}
+
+Simulation scale:
+- Entities: {total_nodes}
+- Relationships: {total_edges}
+- Entity types: {entity_types}
+- Active agents: {total_entities}
+
+Sample facts retrieved from the simulated world:
+{related_facts_json}
+
+Design two to five sections that explain the conditional outcome, agent
+responses, emerging trends and risks. Follow the requested length and scope."""
+
 # ── 章节生成 prompt ──
 
 SECTION_SYSTEM_PROMPT_TEMPLATE = """\
@@ -908,6 +943,9 @@ class ReportAgent:
         self.graph_id = graph_id
         self.simulation_id = simulation_id
         self.simulation_requirement = simulation_requirement
+
+        self.plan_max_tokens = _report_token_budget('REPORT_PLAN_MAX_TOKENS', 1024)
+        self.section_max_tokens = _report_token_budget('REPORT_SECTION_MAX_TOKENS', 4096)
         
         self.llm = llm_client or LLMClient()
         self.zep_tools = zep_tools or ZepToolsService()
@@ -1202,8 +1240,13 @@ class ReportAgent:
         if progress_callback:
             progress_callback("planning", 30, t('progress.generatingOutline'))
         
-        system_prompt = f"{PLAN_SYSTEM_PROMPT}\n\n{get_language_instruction()}"
-        user_prompt = PLAN_USER_PROMPT_TEMPLATE.format(
+        # Match English requests with English instructions instead of spending
+        # a local model's context budget on a second instruction language.
+        english = get_locale() == 'en'
+        plan_system = PLAN_SYSTEM_PROMPT_EN if english else PLAN_SYSTEM_PROMPT
+        plan_user = PLAN_USER_PROMPT_TEMPLATE_EN if english else PLAN_USER_PROMPT_TEMPLATE
+        system_prompt = f"{plan_system}\n\n{get_language_instruction()}"
+        user_prompt = plan_user.format(
             simulation_requirement=self.simulation_requirement,
             total_nodes=context.get('graph_statistics', {}).get('total_nodes', 0),
             total_edges=context.get('graph_statistics', {}).get('total_edges', 0),
@@ -1218,23 +1261,37 @@ class ReportAgent:
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
                 ],
-                temperature=0.3
+                temperature=0.3,
+                max_tokens=self.plan_max_tokens,
             )
             
             if progress_callback:
                 progress_callback("planning", 80, t('progress.parsingOutline'))
             
-            # 解析大纲
+            # Never turn an invalid or failed provider response into a default
+            # outline that the UI can mistake for successful AI planning.
+            if not isinstance(response, dict):
+                raise ValueError('Report outline must be a JSON object')
+            for field_name in ('title', 'summary'):
+                if not isinstance(response.get(field_name), str) or not response[field_name].strip():
+                    raise ValueError(f'Report outline requires a nonempty {field_name}')
+            supplied_sections = response.get('sections')
+            if not isinstance(supplied_sections, list) or not 2 <= len(supplied_sections) <= 5:
+                raise ValueError('Report outline must contain two to five sections')
             sections = []
-            for section_data in response.get("sections", []):
+            for section_data in supplied_sections:
+                if (not isinstance(section_data, dict)
+                        or not isinstance(section_data.get('title'), str)
+                        or not section_data['title'].strip()):
+                    raise ValueError('Report section requires a nonempty title')
                 sections.append(ReportSection(
-                    title=section_data.get("title", ""),
+                    title=section_data['title'].strip(),
                     content=""
                 ))
             
             outline = ReportOutline(
-                title=response.get("title", "模拟分析报告"),
-                summary=response.get("summary", ""),
+                title=response['title'].strip(),
+                summary=response['summary'].strip(),
                 sections=sections
             )
             
@@ -1245,17 +1302,12 @@ class ReportAgent:
             return outline
             
         except Exception as e:
-            logger.error(t('report.outlinePlanFailed', error=str(e)))
-            # 返回默认大纲（3个章节，作为fallback）
-            return ReportOutline(
-                title="未来预测报告",
-                summary="基于模拟预测的未来趋势与风险分析",
-                sections=[
-                    ReportSection(title="预测场景与核心发现"),
-                    ReportSection(title="人群行为预测分析"),
-                    ReportSection(title="趋势展望与风险提示")
-                ]
-            )
+            logger.error('Report outline generation failed (%s)', type(e).__name__)
+            # Exception bodies may contain provider credentials/request data.
+            raise RuntimeError(
+                f'Report outline generation failed ({type(e).__name__}); '
+                'check provider availability, output format and request budget'
+            ) from None
     
     def _generate_section_react(
         self, 
@@ -1344,19 +1396,12 @@ class ReportAgent:
             response = self.llm.chat(
                 messages=messages,
                 temperature=0.5,
-                max_tokens=4096
+                max_tokens=self.section_max_tokens
             )
 
             # 检查 LLM 返回是否为 None（API 异常或内容为空）
-            if response is None:
-                logger.warning(t('report.sectionIterNone', title=section.title, iteration=iteration + 1))
-                # 如果还有迭代次数，添加消息并重试
-                if iteration < max_iterations - 1:
-                    messages.append({"role": "assistant", "content": "（响应为空）"})
-                    messages.append({"role": "user", "content": "请继续生成内容。"})
-                    continue
-                # 最后一次迭代也返回 None，跳出循环进入强制收尾
-                break
+            if not isinstance(response, str) or not response.strip():
+                raise RuntimeError('Report section generation returned no content')
 
             logger.debug(f"LLM响应: {response[:200]}...")
 
@@ -1431,6 +1476,8 @@ class ReportAgent:
 
                 # 正常结束
                 final_answer = cleaned_response.split("Final Answer:")[-1].strip()
+                if not final_answer:
+                    raise RuntimeError('Report section generation returned an empty final answer')
                 logger.info(t('report.sectionGenDone', title=section.title, count=tool_calls_count))
 
                 if self.report_logger:
@@ -1533,6 +1580,8 @@ class ReportAgent:
             # 直接将这段内容作为最终答案，不再空转
             logger.info(t('report.sectionNoPrefix', title=section.title, count=tool_calls_count))
             final_answer = cleaned_response
+            if not final_answer.strip():
+                raise RuntimeError('Report section generation returned no content')
 
             if self.report_logger:
                 self.report_logger.log_section_content(
@@ -1550,17 +1599,18 @@ class ReportAgent:
         response = self.llm.chat(
             messages=messages,
             temperature=0.5,
-            max_tokens=4096
+            max_tokens=self.section_max_tokens
         )
 
         # 检查强制收尾时 LLM 返回是否为 None
-        if response is None:
-            logger.error(t('report.sectionForceFailed', title=section.title))
-            final_answer = t('report.sectionGenFailedContent')
+        if not isinstance(response, str) or not response.strip():
+            raise RuntimeError('Report section generation returned no content')
         elif "Final Answer:" in response:
             final_answer = response.split("Final Answer:")[-1].strip()
         else:
             final_answer = response
+        if not final_answer.strip():
+            raise RuntimeError('Report section generation returned an empty final answer')
         
         # 记录章节内容生成完成日志
         if self.report_logger:
