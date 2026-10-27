@@ -169,7 +169,8 @@ class LLMClient:
         messages: List[Dict[str, str]],
         temperature: float = 0.7,
         max_tokens: Optional[int] = 4096,
-        response_format: Optional[Dict] = None
+        response_format: Optional[Dict] = None,
+        require_complete: bool = False,
     ) -> str:
         """
         Send chat request
@@ -179,6 +180,7 @@ class LLMClient:
             temperature: Temperature parameter
             max_tokens: Max token count
             response_format: Response format (e.g., JSON mode)
+            require_complete: Reject interrupted or truncated text without retrying.
 
         Returns:
             Model response text
@@ -189,6 +191,14 @@ class LLMClient:
             max_tokens=max_tokens,
             response_format=response_format,
         )
+        if require_complete:
+            choices = getattr(response, 'choices', None) or []
+            if not choices:
+                raise LLMResponseError('LLM returned no choices')
+            finish_reason = getattr(choices[0], 'finish_reason', None)
+            if finish_reason not in {None, 'stop'}:
+                raise LLMResponseError('LLM text generation did not finish completely',
+                                       finish_reason=finish_reason)
         content = extract_chat_completion_text(response)
         return _clean_chat_text(content)
 

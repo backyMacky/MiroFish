@@ -83,20 +83,97 @@ def test_empty_section_response_fails_once_without_replaying_or_publishing(agent
     with pytest.raises(RuntimeError, match='no content'):
         agent._generate_section_react(outline.sections[0], outline, [])
     agent.llm.chat.assert_called_once()
-    assert agent.llm.chat.call_args.kwargs['max_tokens'] == 4096
+    assert agent.llm.chat.call_args.kwargs['max_tokens'] == 384
 
 
 def test_report_budgets_are_explicit_and_reject_invalid_values(monkeypatch, agent):
     monkeypatch.setenv('REPORT_PLAN_MAX_TOKENS', '768')
     monkeypatch.setenv('REPORT_SECTION_MAX_TOKENS', '1536')
+    monkeypatch.setenv('REPORT_ACTION_MAX_TOKENS', '512')
     configured = reports.ReportAgent('graph-owned', 'sim-owned', 'Brief', agent.llm, agent.zep_tools)
     assert configured.plan_max_tokens == 768 and configured.section_max_tokens == 1536
-    for name in ['REPORT_PLAN_MAX_TOKENS', 'REPORT_SECTION_MAX_TOKENS']:
+    assert configured.action_max_tokens == 512
+    for name in ['REPORT_PLAN_MAX_TOKENS', 'REPORT_SECTION_MAX_TOKENS', 'REPORT_ACTION_MAX_TOKENS']:
         for bad in ['0', '255', '8193', 'nan']:
             with monkeypatch.context() as patch:
                 patch.setenv(name, bad)
                 with pytest.raises(ValueError):
                     reports.ReportAgent('graph-owned', 'sim-owned', 'Brief', agent.llm, agent.zep_tools)
+
+
+def _tool(name='quick_search'):
+    return '<tool_call>' + json.dumps({'name': name, 'parameters': {'query': 'price cap'}}) + '</tool_call>'
+
+
+def _section(agent):
+    outline = reports.ReportOutline('Owned report', 'Summary', [reports.ReportSection('Evidence')])
+    return agent._generate_section_react(outline.sections[0], outline, ['Previous owned section'])
+
+
+def test_section_preserves_three_real_calls_and_english_evidence_with_separate_budgets(agent):
+    agent._execute_tool = Mock(return_value='Morgan: "I offer a fixed price cap."')
+    agent.llm.chat.side_effect = [_tool('quick_search'), _tool('panorama_search'),
+                                  _tool('insight_forge'), 'Final Answer: > "I offer a fixed price cap."']
+    body = _section(agent)
+    assert body == '> "I offer a fixed price cap."'
+    assert [c.args[0] for c in agent._execute_tool.call_args_list] == [
+        'quick_search', 'panorama_search', 'insight_forge']
+    calls = agent.llm.chat.call_args_list
+    assert [c.kwargs['max_tokens'] for c in calls] == [384, 384, 384, 4096]
+    messages = calls[0].kwargs['messages']
+    assert messages[0]['content'].startswith('Write one section of a simulation-based')
+    assert 'at least three and at most five' in messages[0]['content']
+    assert all(name in messages[0]['content'] for name in agent.VALID_TOOL_NAMES)
+    assert 'Previous owned section' in messages[1]['content']
+    observations = [m['content'] for m in messages if m['role'] == 'user' and 'returned:' in m['content']]
+    assert len(observations) == 3
+    assert all('I offer a fixed price cap.' in content for content in observations)
+
+
+def test_repeated_premature_final_cannot_publish_without_three_calls(agent):
+    agent.llm.chat.return_value = 'Final Answer: unsupported agreement'
+    with pytest.raises(RuntimeError, match='insufficient tool evidence'):
+        _section(agent)
+    assert agent.llm.chat.call_count == 5
+
+
+@pytest.mark.parametrize('final', [_tool(), '<tool_call>incomplete', '<tool_result>invented</tool_result>'])
+def test_forced_final_cannot_publish_protocol_or_fabricated_observation(agent, final):
+    agent._execute_tool = Mock(return_value='Owned source evidence')
+    agent.llm.chat.side_effect = [_tool()] * 5 + [final]
+    with pytest.raises(RuntimeError, match='requested a tool|empty final answer'):
+        _section(agent)
+    assert agent._execute_tool.call_count == 5
+    assert agent.llm.chat.call_count == 6
+
+
+def test_forced_final_after_five_calls_keeps_real_body(agent):
+    agent._execute_tool = Mock(return_value='Owned source evidence')
+    agent.llm.chat.side_effect = [_tool()] * 5 + ['Final Answer: Evidence remains limited.']
+    assert _section(agent) == 'Evidence remains limited.'
+    assert agent._execute_tool.call_count == 5
+
+
+def test_other_report_locales_keep_the_original_section_prompt(agent, monkeypatch):
+    monkeypatch.setattr(reports, 'get_locale', lambda: 'zh')
+    agent._execute_tool = Mock(return_value='Owned source evidence')
+    agent.llm.chat.side_effect = [_tool()] * 3 + ['Final Answer: Owned body.']
+    assert _section(agent) == 'Owned body.'
+    assert agent.llm.chat.call_args_list[0].kwargs['messages'][0]['content'].startswith('你是一个')
+
+
+@pytest.mark.parametrize('call', [
+    {'name': 'unknown', 'parameters': {}},
+    {'name': ['quick_search'], 'parameters': {}},
+    {'name': 'quick_search', 'parameters': 'invalid'},
+    {'name': 'quick_search', 'tool': 'unknown', 'parameters': {}},
+])
+def test_invalid_xml_tool_calls_fail_without_execution(agent, call):
+    agent._execute_tool = Mock()
+    agent.llm.chat.return_value = '<tool_call>' + json.dumps(call) + '</tool_call>'
+    with pytest.raises(RuntimeError, match='invalid tool call'):
+        _section(agent)
+    agent._execute_tool.assert_not_called()
 
 
 @pytest.mark.parametrize('tz', [None, timezone.utc, timezone(timedelta(hours=5, minutes=30))])
