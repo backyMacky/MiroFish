@@ -4,9 +4,12 @@ Zep图谱记忆更新服务
 """
 
 import time
+import json
+import os
+from pathlib import Path
 import threading
 from typing import Dict, Any, List, Optional
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from queue import Queue, Empty
 
@@ -744,6 +747,71 @@ class ZepGraphMemoryManager:
             if cls._updaters.get(simulation_id) is updater:
                 cls._updaters.pop(simulation_id, None)
         logger.info(f"已停止图谱记忆更新器: simulation_id={simulation_id}")
+
+    @classmethod
+    def acknowledge_failed_local_updater(cls, simulation_id: str, receipt_path: Path):
+        """Preserve failed deliveries before an explicit restart releases ownership.
+
+        Cloud/ambiguous submissions cannot prove quiescence and remain blocked.
+        The caller must hold the runner's finalization lock with no live producer.
+        """
+        from .local_graph_store import LocalGraphStore
+
+        with cls._lock:
+            updater = cls._updaters.get(simulation_id)
+            if updater is None:
+                return
+            store = getattr(updater.client, 'store', None)
+            if Config.GRAPH_BACKEND != 'local' or not isinstance(store, LocalGraphStore):
+                raise RuntimeError('Failed graph submissions require verified local receipts before restart')
+            with updater._acceptance_lock, updater._buffer_lock:
+                if (updater._running
+                        or (updater._worker_thread and updater._worker_thread.is_alive())
+                        or not updater._activity_queue.empty()
+                        or any(updater._platform_buffers.values())):
+                    raise RuntimeError('Graph activity producer has not drained; restart remains blocked')
+                with store.db() as connection:
+                    connection.execute('BEGIN IMMEDIATE')
+                    if connection.execute(
+                        "SELECT 1 FROM episodes WHERE graph_id=? AND status IN ('queued','running')",
+                        (updater.graph_id,),
+                    ).fetchone():
+                        raise RuntimeError('Graph ingestion is still active; restart remains blocked')
+                    episodes = [dict(row) for row in connection.execute(
+                        'SELECT * FROM episodes WHERE graph_id=? ORDER BY created_at,uuid',
+                        (updater.graph_id,),
+                    )]
+                    owned = [row for row in episodes
+                             if json.loads(row['metadata']).get('simulation_id') == simulation_id]
+                    confirmed = {row['uuid']: row for row in owned}
+                    if any(confirmed.get(value, {}).get('status') not in {'succeeded', 'failed'}
+                           for value in updater._pending_episode_uuids):
+                        raise RuntimeError('Unconfirmed graph receipt; restart remains blocked')
+                    receipt = {
+                        'simulation_id': simulation_id,
+                        'graph_id': updater.graph_id,
+                        'acknowledged_at': datetime.now().astimezone().isoformat(),
+                        'reason': 'Explicit restart of failed run; deliveries are not replayed',
+                        'episodes': owned,
+                        'pending_episode_uuids': list(updater._pending_episode_uuids),
+                        'failed_batches': [
+                            {**batch, 'activities': [asdict(item) for item in batch['activities']]}
+                            for batch in updater._failed_batches
+                        ],
+                    }
+                    receipt_path = Path(receipt_path)
+                    # A failed write leaves the ownership barrier registered.
+                    # Keep any previous receipt as well as the current snapshot.
+                    if receipt_path.exists():
+                        previous = json.loads(receipt_path.read_text(encoding='utf-8'))
+                        receipt['previous_acknowledgement'] = previous
+                    temporary = receipt_path.with_suffix('.tmp')
+                    with temporary.open('w', encoding='utf-8') as output:
+                        json.dump(receipt, output, ensure_ascii=False, indent=2)
+                        output.flush()
+                        os.fsync(output.fileno())
+                    os.replace(temporary, receipt_path)
+                cls._updaters.pop(simulation_id)
     
     # 防止 stop_all 重复调用的标志
     _stop_all_done = False

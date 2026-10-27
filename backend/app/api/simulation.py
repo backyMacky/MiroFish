@@ -7,6 +7,7 @@ import os
 import threading
 import traceback
 from contextlib import nullcontext
+from functools import wraps
 from flask import request, jsonify, send_file
 
 from . import simulation_bp
@@ -28,6 +29,27 @@ from ..models.project import ProjectManager
 
 logger = get_logger('mirofish.api.simulation')
 _prepare_locks = tuple(threading.Lock() for _ in range(32))
+_start_locks = {}
+_start_locks_guard = threading.Lock()
+
+
+def _serialize_simulation_start(function):
+    """Keep explicit restart's check/archive/launch atomic for this simulation."""
+    @wraps(function)
+    def guarded():
+        identifier = (request.get_json(silent=True) or {}).get('simulation_id')
+        if not isinstance(identifier, str) or not identifier:
+            return function()
+        with _start_locks_guard:
+            lock = _start_locks.setdefault(identifier, threading.Lock())
+        if not lock.acquire(blocking=False):
+            return jsonify({'success': False, 'pending': True,
+                            'error': 'Another start or restart is in progress'}), 409
+        try:
+            return function()
+        finally:
+            lock.release()
+    return guarded
 
 
 def _get_default_platform(simulation_id: str) -> str:
@@ -1557,6 +1579,7 @@ def generate_profiles():
 # ============== 模拟运行控制接口 ==============
 
 @simulation_bp.route('/start', methods=['POST'])
+@_serialize_simulation_start
 def start_simulation():
     """
     开始运行模拟
@@ -1699,7 +1722,11 @@ def start_simulation():
                         }), 400
                     logger.info(f"强制模式：先完成旧模拟终止 {simulation_id}")
                     try:
-                        stopped = SimulationRunner.request_stop(simulation_id)
+                        if run_state.runner_status == RunnerStatus.FAILED:
+                            SimulationRunner.acknowledge_failed_restart(simulation_id)
+                            stopped = run_state
+                        else:
+                            stopped = SimulationRunner.request_stop(simulation_id)
                     except SimulationStopPending as error:
                         return jsonify({
                             "success": False,
@@ -1714,7 +1741,7 @@ def start_simulation():
                                 f"finalizes safely: {error}"
                             ),
                         }), 409
-                    if stopped.runner_status != RunnerStatus.STOPPED:
+                    if stopped.runner_status not in {RunnerStatus.STOPPED, RunnerStatus.FAILED}:
                         return jsonify({
                             "success": False,
                             "error": "Previous simulation did not reach STOPPED",

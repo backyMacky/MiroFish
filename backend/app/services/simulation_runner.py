@@ -231,6 +231,7 @@ class SimulationRunner:
     RUN_ARTIFACT_PATHS = (
         'run_state.json', 'simulation.log', 'stdout.log', 'stderr.log',
         'env_status.json', 'twitter/actions.jsonl', 'reddit/actions.jsonl',
+        'graph_memory_failure.json',
         'ipc_commands', 'ipc_responses',
         *(platform + '_simulation.db' + suffix
           for platform in ('twitter', 'reddit') for suffix in ('', '-wal', '-shm')),
@@ -1050,6 +1051,35 @@ class SimulationRunner:
                 # A worker may itself report a bounded finalization timeout.
                 return future.result()
             raise SimulationStopPending('Stop accepted; graph finalization is still in progress') from error
+
+    @classmethod
+    def acknowledge_failed_restart(cls, simulation_id: str):
+        """Release terminal local ingestion after preserving the failed attempt."""
+        from pathlib import Path
+
+        lock = cls._finalization_lock(simulation_id)
+        if not lock.acquire(blocking=False):
+            raise SimulationStopPending('Previous run is still finalizing')
+        try:
+            state = cls.get_run_state(simulation_id)
+            if state is None or state.runner_status != RunnerStatus.FAILED:
+                raise RuntimeError('Only a failed run may acknowledge failed ingestion')
+            process = cls._processes.get(simulation_id)
+            monitor = cls._monitor_threads.get(simulation_id)
+            with cls._stop_request_guard:
+                stopping = simulation_id in cls._stop_requests
+            if (stopping or (process and process.poll() is None)
+                    or (monitor and monitor.is_alive())):
+                raise SimulationStopPending('Close the previous environment and wait for finalization before restarting')
+            ZepGraphMemoryManager.acknowledge_failed_local_updater(
+                simulation_id,
+                Path(cls.RUN_STATE_DIR) / simulation_id / 'graph_memory_failure.json',
+            )
+            cls._graph_memory_enabled.pop(simulation_id, None)
+            cls._manual_stop_requests.discard(simulation_id)
+            # Keep FAILED and its original diagnostic for the run archive.
+        finally:
+            lock.release()
 
     @classmethod
     def stop_simulation(cls, simulation_id: str, *, wait_timeout: float | None = None) -> SimulationRunState:
