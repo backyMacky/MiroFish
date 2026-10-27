@@ -731,6 +731,9 @@ class SimulationRunner:
                     elif not manual_stop and exit_code != 0:
                         desired_status = RunnerStatus.FAILED
                         main_log_path = os.path.join(sim_dir, "simulation.log")
+                        process_output = os.path.join(sim_dir, "stdout.log")
+                        if os.path.isfile(process_output):
+                            main_log_path = process_output
                         error_info = ""
                         try:
                             if os.path.exists(main_log_path):

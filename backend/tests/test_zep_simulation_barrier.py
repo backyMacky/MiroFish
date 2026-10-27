@@ -174,7 +174,8 @@ def test_runner_refuses_unarchived_events_before_launch(monkeypatch, tmp_path):
         SimulationRunner.start_simulation('sim-unarchived')
 
 
-def test_real_subprocess_output_does_not_collide_with_structured_log(monkeypatch, tmp_path):
+@pytest.mark.parametrize('fails', [False, True])
+def test_real_subprocess_output_does_not_collide_with_structured_log(monkeypatch, tmp_path, fails):
     import shutil
     from pathlib import Path
     simulation_id = 'sim-independent-output'
@@ -189,22 +190,29 @@ def test_real_subprocess_output_does_not_collide_with_structured_log(monkeypatch
         "print('before structured logger')\n"
         "log = SimulationLogManager(os.getcwd())\nlog.info('main marker')\n"
         "print('IPC marker after structured logger')\n"
-        "assert os.environ['PYTHONUNBUFFERED'] == '1'\n",
+        "assert os.environ['PYTHONUNBUFFERED'] == '1'\n"
+        + ("raise RuntimeError('owned process failure marker')\n" if fails else ''),
         encoding='utf-8',
     )
     monkeypatch.setattr(SimulationRunner, 'RUN_STATE_DIR', str(tmp_path))
     monkeypatch.setattr(SimulationRunner, 'SCRIPTS_DIR', str(scripts))
+    monitor = SimulationRunner._monitor_simulation
     monkeypatch.setattr(SimulationRunner, '_monitor_simulation', classmethod(lambda *_args: None))
     monkeypatch.setattr(SimulationRunner, '_sync_simulation_status', classmethod(lambda *_args: None))
     process = None
     try:
         SimulationRunner.start_simulation(simulation_id, platform='twitter')
         process = SimulationRunner._processes[simulation_id]
-        assert process.wait(timeout=10) == 0
+        assert process.wait(timeout=10) == (1 if fails else 0)
         output = (directory / 'stdout.log').read_text(encoding='utf-8')
         assert 'before structured logger' in output
         assert 'IPC marker after structured logger' in output
         assert 'main marker' in (directory / 'simulation.log').read_text(encoding='utf-8')
+        monitor(simulation_id)
+        if fails:
+            state = SimulationRunner.get_run_state(simulation_id)
+            assert state.runner_status == RunnerStatus.FAILED
+            assert 'owned process failure marker' in state.error
     finally:
         if process is not None:
             if process.poll() is None:
